@@ -1,0 +1,4 @@
+# llvm-runtimes/libgcc is not stabilized yet. It also depends on an unstable
+# version of libunwind.
+llvm-runtimes/libgcc
+llvm-runtimes/libunwind
