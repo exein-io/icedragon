@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: 00 4 * * *
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-stable:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy, rust-src
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --workspace -- --deny warnings
+
+  lint-nightly:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt, rust-src
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  build-container-image:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            type: cross
+          - target: x86_64-unknown-linux-musl
+            type: native
+    name: container ${{ matrix.type }} ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          set -euxo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build container image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cargo run build-container-image \
+            --tag ghcr.io/${{ github.repository }}/${{ matrix.type }}-${{ matrix.target }}:latest \
+            --target ${{ matrix.target }} \
+            --push
+
+      - name: Build container image
+        if: github.ref != 'refs/heads/main'
+        run: |
+          cargo run build-container-image \
+            --tag ghcr.io/${{ github.repository }}/${{ matrix.type }}-${{ matrix.target }}:${{ github.head_ref }} \
+            --target ${{ matrix.target }} \
+            --push
