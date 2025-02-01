@@ -1,0 +1,45 @@
+# This file unmasks unstable Gentoo packages.
+#
+# Stability of package versions is determined by keywords. Package version is
+# considered stable on the given architecture if it contains a corresponding
+# keyword. Examples of keywords are: amd64, arm, arm64, riscv.
+#
+# If the given version is undergoing testing for the given architecture, it
+# contains a keyword with `~` prefix. Examples: ~amd64, ~arm, ~arm64, ~riscv.
+#
+# If there is no keyword for the given architecture, the package version is
+# masked.
+#
+# If you look at a package on packages.gentoo.org, the stable versions are
+# marked with green color, unstable versions with yellow color and versions
+# without keywords with no color. Example:
+# https://packages.gentoo.org/packages/app-emulation/qemu
+#
+# By default, emerge installs only stable versions for the requested
+# architecture.
+# Unmasking of testing versions is done by specifying the package name.
+# Unmasking of versions with no keywords is done by specifying the package name
+# with double asterisk (`**`).
+#
+# Unmasks done for specific versions with equality symbol (`=`) are affecting
+# only these versions.
+# If the mentioned version becomes stabilized, the unmask doesn't really do
+# anything - emerge is going to pick the newest stable version available. If
+# there is even newer version stabilized, emerge is going to choose it.
+# Nothing changes if a newer version becomes available as a testing or masked
+# package - the specified version is stil the one which is going to be
+# installed.
+#
+# More details:
+# https://wiki.gentoo.org/wiki/Knowledge_Base:Accepting_a_keyword_for_a_single_package
+
+# QEMU 9.1.2 (the current stable) doesn't build with musl. All newer versions
+# build without problems. Unmask the latest testing package.
+=app-emulation/qemu-9.2.0
+
+# llvm-runtimes/libgcc is undergoing testing for amd64 and provides no keywords
+# for the rest of architectures. Unmask it with `**`. Our CI proves that it works
+# with arm64.
+=llvm-runtimes/libgcc-19.1.7 **
+# libgcc requires a testing version (19.1.7) of libunwind.
+=llvm-runtimes/libunwind-19.1.7
