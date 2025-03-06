@@ -2,6 +2,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     io::{BufRead as _, BufReader, Write as _},
+    iter,
     process::{Command, Stdio},
     str::FromStr as _,
     thread,
@@ -255,7 +256,7 @@ struct RunArgs {
 
     /// The command to run inside the container.
     #[arg(trailing_var_arg = true)]
-    pub cmd: Vec<String>,
+    pub cmd: Vec<OsString>,
 }
 
 /// Takes a `cmd`, representing a container engine, and adds `--env` arguments,
@@ -308,20 +309,16 @@ fn add_env_args(cmd: &mut Command, triple: &Triple) {
 /// * Provided `cmd_args` as a command to run inside a container.
 ///
 /// Target `triple` is used to determine additional environment variables,
-fn run_container<E, C>(
+fn run_container(
     container_engine: &ContainerEngine,
     runner: Option<&OsStr>,
     interactive: bool,
     triple: &Triple,
     container_image: &OsStr,
-    container_engine_args: &[E],
-    volumes: &[String],
-    cmd_args: &[C],
-) -> anyhow::Result<()>
-where
-    E: AsRef<OsStr>,
-    C: AsRef<OsStr>,
-{
+    container_engine_args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    cmd_args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> anyhow::Result<()> {
     let mut bind_mount = env::current_dir()?.into_os_string();
     bind_mount.push(":/src");
 
@@ -366,13 +363,13 @@ where
 }
 
 /// Runs cargo inside a container.
-fn cargo(
+fn cargo<'a>(
     container_engine: &ContainerEngine,
     runner: Option<&OsStr>,
     triple: &Triple,
     container_image: &OsStr,
     volumes: &[String],
-    cmd: &[String],
+    cmd: impl IntoIterator<Item = &'a dyn AsRef<OsStr>>,
 ) -> anyhow::Result<()> {
     // Pass additional environment variables:
     //
@@ -397,8 +394,9 @@ fn cargo(
     ];
 
     // The command is `cargo` followed by arguments provided by the caller.
-    let mut cmd_args = vec!["cargo".to_owned()];
-    cmd_args.extend_from_slice(cmd);
+    let cargo_cmd: &dyn AsRef<OsStr> = &"cargo";
+    let cmd_args = iter::once(cargo_cmd);
+    let cmd_args = cmd_args.chain(cmd);
 
     run_container(
         container_engine,
@@ -408,18 +406,18 @@ fn cargo(
         container_image,
         container_engine_args,
         volumes,
-        &cmd_args,
+        cmd_args,
     )
 }
 
 /// Runs clang inside a container.
-fn clang(
+fn clang<'a>(
     container_engine: &ContainerEngine,
     runner: Option<&OsStr>,
     triple: &Triple,
     container_image: &OsStr,
     volumes: &[String],
-    cmd: &[String],
+    cmd: impl IntoIterator<Item = &'a dyn AsRef<OsStr>>,
 ) -> anyhow::Result<()> {
     // The command is a clang wrapper (e.g. `aarch64-unknown-linux-musl-clang`)
     // followed by arguments provided by the caller.
@@ -438,8 +436,9 @@ fn clang(
         }
         (_, _, _) => return Err(anyhow!("target {triple} is not supported")),
     };
-    let mut cmd_args = vec![clang_cmd.to_owned()];
-    cmd_args.extend_from_slice(cmd);
+    let clang_cmd: &dyn AsRef<OsStr> = &clang_cmd;
+    let cmd_args = iter::once(clang_cmd);
+    let cmd_args = cmd_args.chain(cmd);
 
     let container_engine_args: &[OsString] = &[];
 
@@ -451,20 +450,20 @@ fn clang(
         container_image,
         container_engine_args,
         volumes,
-        &cmd_args,
+        cmd_args,
     )
 }
 
 /// Runs `CMake` inside a container. If the command involves configuring a
 /// project, adds parameters necessary for cross-compilation for the given
 /// target.
-fn cmake(
+fn cmake<'a>(
     container_engine: &ContainerEngine,
     runner: Option<&OsStr>,
     triple: &Triple,
     container_image: &OsStr,
     volumes: &[String],
-    cmd: &[String],
+    cmd: impl Iterator<Item = &'a dyn AsRef<OsStr>>,
 ) -> anyhow::Result<()> {
     // Determine whether we are configuring a CMake project.
     //
@@ -538,13 +537,13 @@ fn cmake(
 }
 
 /// Run a command inside a container.
-fn run(
+fn run<'a>(
     container_engine: &ContainerEngine,
     runner: Option<&OsStr>,
     triple: &Triple,
     container_image: &OsStr,
     volumes: &[String],
-    cmd: &[String],
+    cmd: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> anyhow::Result<()> {
     let container_engine_args: &[OsString] = &[];
     run_container(
@@ -617,13 +616,17 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
+            let cmd = cmd.iter().map(|arg| {
+                let arg: &dyn AsRef<OsStr> = arg;
+                arg
+            });
             cargo(
                 container_engine,
                 runner,
                 &triple,
                 &container_image,
                 &volumes,
-                &cmd,
+                cmd,
             )
         }
         Commands::Clang(args) => {
@@ -632,13 +635,17 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
+            let cmd = cmd.iter().map(|arg| {
+                let arg: &dyn AsRef<OsStr> = arg;
+                arg
+            });
             clang(
                 container_engine,
                 runner,
                 &triple,
                 &container_image,
                 &volumes,
-                &cmd,
+                cmd,
             )
         }
         Commands::Cmake(args) => {
@@ -647,13 +654,17 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
+            let cmd = cmd.iter().map(|arg| {
+                let arg: &dyn AsRef<OsStr> = arg;
+                arg
+            });
             cmake(
                 container_engine,
                 runner,
                 &triple,
                 &container_image,
                 &volumes,
-                &cmd,
+                cmd,
             )
         }
         Commands::Run(args) => {
