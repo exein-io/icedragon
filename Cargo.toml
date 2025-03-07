@@ -1,6 +1,21 @@
 [package]
 name = "icedragon"
 version = "0.0.1"
+authors = ["Michal Rostecki <vadorovsky@protonmail.com>"]
+description = "Linux cross-compilation suite for building portable software"
+license = "Apache-2.0"
+keywords = [
+    "compilation",
+    "cross",
+    "linux",
+    "llvm",
+    "musl"
+]
+categories = [
+    "development-tools",
+    "command-line-utilities",
+    "os::linux-apis",
+]
 edition = "2021"
 
 [dependencies]
