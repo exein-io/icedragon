@@ -40,6 +40,6 @@
 # llvm-runtimes/libgcc is undergoing testing for amd64 and provides no keywords
 # for the rest of architectures. Unmask it with `**`. Our CI proves that it works
 # with arm64.
-=llvm-runtimes/libgcc-19.1.7 **
+=llvm-runtimes/libgcc-19.1.7-r1 **
 # libgcc requires a testing version (19.1.7) of libunwind.
 =llvm-runtimes/libunwind-19.1.7
