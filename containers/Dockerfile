@@ -6,7 +6,7 @@ ARG LLVM_VERSION=19
 
 # Gentoo stores LLVM toolchains in "slotted" directories inside /usr/lib/llvm.
 # Rustup stores Rust toolchains in ~/.cargo/bin. Add these directories to PATH.
-ENV PATH="/home/icedragon/.cargo/bin:/usr/lib/llvm/${LLVM_VERSION}/bin:${PATH}"
+ENV PATH="/home/icedragon/.cargo/bin:/opt/icedragon/bin:/usr/lib/llvm/${LLVM_VERSION}/bin:${PATH}"
 # Enable static libraries for installed packages (zstd, zlib etc.).
 ENV USE="static-libs"
 # Specify QEMU targets to enable.
@@ -101,6 +101,9 @@ RUN emerge-webrsync \
         dev-util/rustup \
         llvm-runtimes/libgcc \
         sys-devel/crossdev \
+    && mkdir -p /opt/icedragon/bin \
+    && curl -L https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-$(arch)-unknown-linux-musl.tgz \
+        | tar -zxpf - -C /opt/icedragon/bin \
     && eselect repository create crossdev \
     && crossdev --llvm --target aarch64-unknown-linux-musl \
     && curl -L "https://ftp-osl.osuosl.org/pub/gentoo/releases/arm64/autobuilds/current-stage3-arm64-musl-llvm/$(\
