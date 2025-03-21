@@ -24,6 +24,7 @@ chrono = { version = "0.4", default-features = false }
 clap = { version = "4.5", default-features = false, features = ["derive", "help", "std"] }
 env_logger = { version = "0.11", default-features = false }
 log = { version = "0.4", default-features = false }
+nix = { version = "0.29", default-features = false, features = ["user"] }
 target-lexicon = { version = "0.12", default-features = false }
 thiserror = { version = "1.0.64", default-features = false }
 uuid = { version = "1.10", default-features = false, features = ["v4"] }
