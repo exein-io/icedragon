@@ -135,6 +135,23 @@ where
     assert_eq!(elf.header.e_machine, elf_machine);
 }
 
+/// Tests whether:
+///
+/// * We can install projects with cargo-binstall into the cargo
+///   volume.
+/// * The installed artifacts are persistent across icedragon invocations.
+#[test]
+fn test_cargo_binstall() {
+    let current_dir = env::current_dir().unwrap();
+    let target = format!("{}", target_lexicon::HOST);
+    icedragon_cmd(&current_dir, "cargo", &target)
+        .args(["binstall", "-y", "cargo-hack"])
+        .assert_success();
+    icedragon_cmd(&current_dir, "run", &target)
+        .args(["which", "cargo-hack"])
+        .assert_success();
+}
+
 /// Tests cargo support by cross-compiling pulsar.
 #[test_case("aarch64-unknown-linux-musl", elf_header::EM_AARCH64 ; "aarch64")]
 #[test_case("x86_64-unknown-linux-musl", elf_header::EM_X86_64 ; "x86_64")]
