@@ -6,7 +6,7 @@ ARG LLVM_VERSION=19
 
 # Gentoo stores LLVM toolchains in "slotted" directories inside /usr/lib/llvm.
 # Rustup stores Rust toolchains in ~/.cargo/bin. Add these directories to PATH.
-ENV PATH="/root/.cargo/bin:/usr/lib/llvm/${LLVM_VERSION}/bin:${PATH}"
+ENV PATH="/home/icedragon/.cargo/bin:/usr/lib/llvm/${LLVM_VERSION}/bin:${PATH}"
 # Enable static libraries for installed packages (zstd, zlib etc.).
 ENV USE="static-libs"
 # Specify QEMU targets to enable.
@@ -81,13 +81,6 @@ COPY package.use/* /etc/portage/package.use/
 # * Regular expressions:
 #   * libpcre2
 #
-# Install stable and beta Rust toolchains with `default` rustup profile
-# (containing rust-docs, rustfmt, and clippy) for all supported targets.
-#
-# Install nightly Rust toolchains with `complete` rustup profile (containing
-# all components provided by rustup, available only for nightly toolchains)
-# for all supported targets.
-#
 # [0] https://wiki.gentoo.org/wiki/Crossdev
 # [1] https://github.com/llvm/llvm-project/tree/main/llvm-libgcc
 # [2] https://github.com/rust-lang/rust/issues/119504
@@ -161,14 +154,18 @@ RUN emerge-webrsync \
         sys-libs/error-standalone \
         sys-libs/fts-standalone \
         sys-libs/zlib \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustup toolchain install stable beta --profile=default \
-        --target=aarch64-unknown-linux-musl,x86_64-unknown-linux-musl \
-    && rustup toolchain install nightly --profile=complete \
-        --target=aarch64-unknown-linux-musl,x86_64-unknown-linux-musl \
-    && cargo install btfdump \
+    && useradd -m -G users -s /bin/bash icedragon \
     && rm -rf \
         /var/cache/binpkgs/* \
         /var/cache/distfiles/* \
         /var/db/repos/* \
         /var/tmp/portage/*
+
+COPY entrypoint.sh /entrypoint.sh
+
+USER icedragon
+# Ensure that the mount targets for named volumes are owned by the `icedragon`
+# user.
+RUN mkdir /home/icedragon/{.cargo,.rustup}
+
+ENTRYPOINT ["/entrypoint.sh"]
