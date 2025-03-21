@@ -37,6 +37,11 @@
 # build without problems. Unmask the latest testing package.
 =app-emulation/qemu-9.2.2
 
+# Use the newest Rust and rustup version. The one considered stable in Gentoo
+# is old, we gotta go fast.
+=dev-lang/rust-bin-1.85.0-r1
+=dev-util/rustup-1.28.1
+
 # llvm-runtimes/libgcc is undergoing testing for amd64 and provides no keywords
 # for the rest of architectures. Unmask it with `**`. Our CI proves that it works
 # with arm64.

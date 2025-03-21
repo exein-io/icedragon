@@ -1,0 +1,19 @@
+# This file unmasks the Gentoo packages which are masked, either by the base
+# profile[0] or the musl-llvm one[1].
+#
+# Masked packages in Gentoo are packages which are explicitly forbidden to
+# install, even when the keywords matches (so `package.accept_keywords`
+# doesn't help here).
+#
+# Listing a package in `package.mask` masks a package.
+# Listing a package with `-` prefix unmasks it.
+#
+# We use the latter property to unmask packages, which are masked by Gentoo
+# upstream.
+#
+# [0] https://github.com/gentoo/gentoo/blob/master/profiles/package.mask
+# [1] https://github.com/gentoo/gentoo/blob/master/profiles/features/musl/llvm/package.mask
+
+# rust-bin ends up being masked on musl-llvm provile. Probably a bug, but for
+# now let's unmask ourselves.
+-dev-lang/rust-bin
