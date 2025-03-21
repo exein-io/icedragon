@@ -4,6 +4,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::{BufRead as _, BufReader, Write as _},
     iter,
+    os::unix::ffi::OsStrExt as _,
     process::{Command, Stdio},
     str::FromStr as _,
     thread,
@@ -293,8 +294,8 @@ struct RunArgs {
 /// Takes a `cmd`, representing a container engine, and adds `--env` arguments,
 /// consisting of:
 ///
-/// * The current environment variables, except `PATH`, which should be
-///   inherited from the Dockerfile.
+/// * The current environment variables, except `HOME` and `PATH`, which should
+///   remain unchanged.
 /// * Additional variables defined by us:
 ///   * `CXXFLAGS` and `LDFLAGS`, pointing to LLVM libc++ as a C++ stdlib, LLD
 ///     as a linker, compiler-rt as a runtime library and LLVM libunwind as
@@ -302,18 +303,24 @@ struct RunArgs {
 ///   * `PKG_CONFIG_SYSROOT_DIR`, to point pkg-config to the sysroot.
 fn add_env_args(cmd: &mut Command, triple: &Triple) {
     for (key, value) in env::vars_os() {
-        if key != "PATH" {
-            let mut env_arg = OsString::from("--env=");
-            env_arg.push(key);
-            env_arg.push("=");
-            env_arg.push(value);
-            cmd.arg(env_arg);
+        let key_b = key.as_bytes();
+        if key == "HOME"
+            || key == "PATH"
+            || key_b.starts_with(b"CARGO")
+            || key_b.starts_with(b"RUSTUP")
+        {
+            continue;
         }
+
+        let mut env_arg = OsString::from("--env=");
+        env_arg.push(key);
+        env_arg.push("=");
+        env_arg.push(value);
+        cmd.arg(env_arg);
     }
     cmd.arg("--env=CXXFLAGS=--stdlib=libc++");
     cmd.arg("--env=LDFLAGS=-fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind");
     cmd.arg(format!("--env=PKG_CONFIG_SYSROOT_DIR=/usr/{triple}"));
-    cmd.arg("--env=RUSTUP_HOME=/root/.rustup");
 
     let mut rustflags_arg = OsString::from("--env=RUSTFLAGS=");
     rustflags_arg.push(env::var_os("RUSTFLAGS").unwrap_or_default());
@@ -352,13 +359,26 @@ fn run_container(
     let mut bind_mount = env::current_dir()?.into_os_string();
     bind_mount.push(":/src");
 
+    let uid = nix::unistd::getuid();
+
     let mut container = Command::new(container_engine);
     container.arg("run");
     add_env_args(&mut container, triple);
     if interactive {
         container.arg("-it");
     }
-    container.args(["--rm", "-v"]).arg(&bind_mount);
+    container
+        .args([
+            "--rm",
+            "-v",
+            "cargo:/home/icedragon/.cargo",
+            "-v",
+            "rustup:/home/icedragon/.rustup",
+            "-v",
+        ])
+        .arg(&bind_mount)
+        .arg("-u")
+        .arg(format!("{uid}:1000"));
     for volume in volumes {
         container.arg("-v");
         container.arg(volume);
