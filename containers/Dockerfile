@@ -89,6 +89,7 @@ RUN emerge-webrsync \
     && emerge \
         app-emulation/qemu \
         app-eselect/eselect-repository \
+        app-misc/ca-certificates \
         llvm-runtimes/libgcc \
         sys-devel/crossdev \
     && mkdir -p /opt/icedragon/bin \
