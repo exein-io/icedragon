@@ -57,6 +57,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Pull the base image and the image we're trying to build, to trigger
+      # a build only if neccessary:
+      #
+      # * If there is a newer base image.
+      # * If `Dockerfile` was modified.
+      - name: Pull the Gentoo image
+        run: docker pull docker.io/gentoo/stage3:musl-llvm
+      - name: Pull the icedragon image
+        if: github.ref == 'refs/heads/main'
+        run: docker pull ghcr.io/${{ github.repository }}:latest
+      - name: Pull the icedragon image
+        if: github.ref != 'refs/heads/main'
+        run: docker pull ghcr.io/${{ github.repository }}:${{ github.head_ref }}
+
       - name: Build container image
         if: github.ref == 'refs/heads/main'
         run: |
