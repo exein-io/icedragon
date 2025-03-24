@@ -89,3 +89,7 @@ jobs:
         if: github.ref != 'refs/heads/main'
         env:
           ICEDRAGON_CONTAINER_IMAGE: ghcr.io/${{ github.repository }}:${{ github.head_ref }}
+
+      - name: Setup tmate session
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3
