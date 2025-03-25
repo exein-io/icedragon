@@ -279,7 +279,11 @@ fn build_container_image(
 #[derive(Parser)]
 struct RunArgs {
     /// Container image to use.
-    #[arg(long, default_value = "ghcr.io/exein-io/icedragon:latest")]
+    #[arg(
+        long,
+        env = "ICEDRAGON_CONTAINER_IMAGE",
+        default_value = "ghcr.io/exein-io/icedragon:latest"
+    )]
     pub container_image: OsString,
 
     /// Additional volumes to mount to the container.

@@ -21,7 +21,7 @@ edition = "2021"
 [dependencies]
 anyhow = { version = "1.0.89", default-features = false }
 chrono = { version = "0.4", default-features = false }
-clap = { version = "4.5", default-features = false, features = ["derive", "help", "std"] }
+clap = { version = "4.5", default-features = false, features = ["derive", "env", "help", "std"] }
 env_logger = { version = "0.11", default-features = false }
 log = { version = "0.4", default-features = false }
 nix = { version = "0.29", default-features = false, features = ["user"] }
