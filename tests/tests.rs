@@ -1,7 +1,9 @@
 use std::{
-    env, fmt,
+    env,
+    ffi::OsString,
+    fmt,
     fs::{self, File},
-    io::{BufReader, Read},
+    io::{BufReader, Read as _},
     path::Path,
     process::{Command, Output},
     sync::LazyLock,
@@ -31,24 +33,6 @@ static TEMPDIR: LazyLock<TempDir> = LazyLock::new(|| {
     temp_dir
 });
 
-fn extract_tarball<P, R>(mut archive: Archive<R>, dest_dir: P)
-where
-    P: AsRef<Path>,
-    R: Read,
-{
-    for entry_result in archive.entries().unwrap() {
-        let mut entry = entry_result.unwrap();
-
-        let entry_path = entry.path().unwrap();
-        let entry_path = dest_dir.as_ref().join(entry_path);
-        if let Some(parent) = entry_path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-
-        entry.unpack(entry_path).unwrap();
-    }
-}
-
 fn download_and_extract_tarball<P>(url: &str, dest_dir: P)
 where
     P: AsRef<Path>,
@@ -63,18 +47,23 @@ where
 
     if ext.eq_ignore_ascii_case("gz") {
         let stream = GzDecoder::new(reader);
-        let archive = Archive::new(stream);
-        extract_tarball(archive, dest_dir);
+        let mut archive = Archive::new(stream);
+        archive.unpack(dest_dir).unwrap();
     } else if ext.eq_ignore_ascii_case("xz") {
         let stream = XzDecoder::new(reader);
-        let archive = Archive::new(stream);
-        extract_tarball(archive, dest_dir);
+        let mut archive = Archive::new(stream);
+        archive.unpack(dest_dir).unwrap();
     } else {
         panic!("unsupported compression format in the URL {url}");
     }
 }
 
-fn icedragon_cmd<P>(dir: P, subcommand: &str, target: &str) -> Command
+fn icedragon_cmd<P>(
+    dir: P,
+    subcommand: &str,
+    target: Option<&str>,
+    volumes: &[(&Path, &str)],
+) -> Command
 where
     P: AsRef<Path>,
 {
@@ -93,9 +82,20 @@ where
     cmd.env_clear()
         .envs(filtered_env)
         .current_dir(dir)
-        .args([subcommand, "--target", target]);
+        .arg(subcommand);
+    if let Some(target) = target {
+        cmd.args(["--target", target]);
+    }
     if let Some(container_image) = env::var_os("ICEDRAGON_CONTAINER_IMAGE") {
         cmd.arg("--container-image").arg(&container_image);
+    }
+    for (src, dst) in volumes {
+        cmd.arg("--volume");
+        let mut volume_arg = OsString::new();
+        volume_arg.push(src);
+        volume_arg.push(":");
+        volume_arg.push(dst);
+        cmd.arg(volume_arg);
     }
     cmd.arg("--");
     cmd
@@ -140,7 +140,7 @@ where
 #[test_case("x86_64-unknown-linux-musl", elf_header::EM_X86_64 ; "x86_64")]
 fn test_cargo_pulsar(target: &str, elf_machine: u16) {
     let dir = TEMPDIR.path().join("pulsar-0.9.0");
-    icedragon_cmd(&dir, "cargo", target)
+    icedragon_cmd(&dir, "cargo", Some(target), &[])
         .arg("build")
         .assert_success();
     let bin_path = dir.join("target").join(target).join("debug/pulsar-exec");
@@ -165,7 +165,7 @@ fn test_cargo_pulsar(target: &str, elf_machine: u16) {
 fn test_cmake_compiler_rt(target: &str, arch: &str, elf_machine: u16, extra_args: &[&'static str]) {
     let dir = TEMPDIR.path().join("llvm-project-19.1.7.src");
     let build_dir = format!("build-{target}");
-    icedragon_cmd(&dir, "cmake", target)
+    icedragon_cmd(&dir, "cmake", Some(target), &[])
         .args([
             "-S",
             "compiler-rt",
@@ -183,10 +183,31 @@ fn test_cmake_compiler_rt(target: &str, arch: &str, elf_machine: u16, extra_args
         ])
         .args(extra_args)
         .assert_success();
-    icedragon_cmd(&dir, "cmake", target)
+    icedragon_cmd(&dir, "cmake", Some(target), &[])
         .args(["--build", &build_dir])
         .assert_success();
     let bin_filename = format!("clang_rt.crtbegin-{arch}.o");
     let bin_path = dir.join(&build_dir).join("lib/linux").join(bin_filename);
     assert_bin_arch(bin_path, elf_machine);
+}
+
+/// Tests bind mount of custom volumes.
+#[test]
+fn test_volumes() {
+    let volume1 = TEMPDIR.path().join("volume1");
+    fs::create_dir(&volume1).unwrap();
+    fs::write(volume1.join("file1"), "ayy lmao").unwrap();
+    let volume2 = TEMPDIR.path().join("volume2");
+    fs::create_dir(&volume2).unwrap();
+    fs::write(volume2.join("file2"), "lorem ipsum").unwrap();
+
+    let current_dir = env::current_dir().unwrap();
+    icedragon_cmd(
+        &current_dir,
+        "run",
+        None,
+        &[(&volume1, "/volume1"), (&volume2, "/volume2")],
+    )
+    .args(["cat", "/volume1/file1", "/volume2/file2"])
+    .assert_success();
 }
