@@ -2,30 +2,62 @@ use std::{
     collections::{vec_deque::Iter, VecDeque},
     env,
     ffi::{OsStr, OsString},
+    fmt,
+    fs::{self, OpenOptions},
     io::{BufRead as _, BufReader, Write as _},
-    iter,
-    process::{Command, Stdio},
+    path::{Component, Path, PathBuf},
+    process::{self, Command, Stdio},
     str::FromStr as _,
+    sync::mpsc,
     thread,
 };
 
-use anyhow::{anyhow, Context as _};
+use anyhow::{anyhow, bail, Context as _};
 use clap::{Parser, Subcommand, ValueEnum};
-use log::{error, info};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use ipc_channel::ipc;
+use log::{debug, error, info};
+use nix::{
+    mount::{mount, MsFlags},
+    sched::{clone, CloneFlags},
+    unistd::{chdir, chroot, Gid, Pid, Uid},
+};
+use oci_client::{
+    client::{ClientConfig as OciClientConfig, ClientProtocol as OciClientProtocol},
+    manifest::OciDescriptor,
+    secrets::RegistryAuth as OciRegistryAuth,
+    Client as OciClient, Reference,
+};
+use rand::{distr::Alphanumeric, rngs::StdRng, Rng as _, SeedableRng as _};
 use target_lexicon::{Architecture, Environment, OperatingSystem, Triple};
+use tokio::{io::AsyncWriteExt as _, task::JoinSet};
+use tokio_stream::StreamExt as _;
 use which::which;
 
 /// Content of the dockerfile.
 const DOCKERFILE: &[u8] = include_bytes!("../containers/Dockerfile");
 
+const LLVM_VERSION: u32 = 19;
+
+const PROGRESS_BAR_TEMPLATE: &str = "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})";
+const PROGRESS_BAR_CHARS: &str = "#>-";
+
 /// A wrapper over [`VecDeque`] making it easy to gather platform-native
 /// strings.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct OsVecDeque(VecDeque<OsString>);
 
 impl OsVecDeque {
-    fn with_capacity(capacity: usize) -> Self {
-        Self(VecDeque::with_capacity(capacity))
+    fn command(&self) -> anyhow::Result<Command> {
+        let mut iter = self.iter();
+        let cmd = iter
+            .next()
+            .ok_or(anyhow!("cannot create a command, vector is empty"))?;
+        let mut cmd = Command::new(cmd);
+        for arg in iter {
+            cmd.arg(arg);
+        }
+        Ok(cmd)
     }
 
     fn contains_any<S>(&self, items: &[S]) -> bool
@@ -67,9 +99,9 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Container engine (if not provided, is going to be autodetected).
-    #[arg(global = true, long)]
-    container_engine: Option<ContainerEngine>,
+    /// Directory where the internal state is stored.
+    #[arg(global = true, long, default_value = "~/.icedragon")]
+    state_dir: OsString,
 
     /// Target triple.
     #[arg(global = true, long)]
@@ -138,6 +170,10 @@ impl ContainerEngine {
 
 #[derive(Parser)]
 struct BuildContainerImageArgs {
+    /// Container engine (if not provided, is going to be autodetected).
+    #[arg(global = true, long)]
+    container_engine: Option<ContainerEngine>,
+
     /// Do not use existing cached images for the container build. Build from
     /// the start with a new set of cached layers.
     #[arg(long)]
@@ -157,6 +193,78 @@ struct BuildContainerImageArgs {
     tags: Vec<OsString>,
 }
 
+#[derive(Parser)]
+struct RunArgs {
+    /// Container image to use.
+    #[arg(long, default_value = "ghcr.io/exein-io/icedragon:latest")]
+    pub container_image: String,
+
+    /// Additional volumes to mount to the container.
+    #[arg(long = "volume", short)]
+    pub volumes: Vec<String>,
+
+    /// The command to run inside the container.
+    #[arg(trailing_var_arg = true)]
+    pub cmd: Vec<OsString>,
+}
+
+/// Parameters used to launch a container.
+#[derive(Clone)]
+struct ContainerContext {
+    /// Indicates whether stdin should be piped to the container.
+    interactive: bool,
+    /// Path to the main directory with icedragon's state.
+    state_dir: PathBuf,
+    /// Path to the container root filesystem.
+    rootfs_dir: PathBuf,
+    /// Target triple.
+    triple: Triple,
+    /// Indicates whether `CC` and `CXX` variables should be set.
+    ///
+    /// Such override is convenient for the most of Rust projects, where
+    /// `build.rs` calls the C/C++ compiler either through the [`cc`] or
+    /// directly.
+    ///
+    /// However, build systems like `CMake` or Meson often use the C/C++
+    /// compiler for building native binaries, which are needed for performing
+    /// the rest of the build, even during cross builds. In that case, setting
+    /// these variables would break the native build. Furthermore, these build
+    /// system are smart enough to pick the cross compiler for building cross
+    /// artifacts.
+    override_cc_with_cross: bool,
+    /// List of user-provided volumes to bind mount to the container.
+    volumes: Vec<String>,
+    /// List of command line arguments to launch inside the container.
+    cmd: OsVecDeque,
+}
+
+impl ContainerContext {
+    /// Creates a new [`Self`] based on provided `state_dir`, target `triple`,
+    /// a list of user-provided `volumes` and `cmd` with list of command line
+    /// arguments to launch inside the container.
+    ///
+    /// `interactive` indicates whether stdin should be piped to the container.
+    fn new(
+        interactive: bool,
+        state_dir: &Path,
+        triple: Triple,
+        override_cc_with_cross: bool,
+        volumes: Vec<String>,
+        cmd: OsVecDeque,
+    ) -> Self {
+        let rootfs_dir = state_dir.join("rootfs");
+        Self {
+            interactive,
+            state_dir: state_dir.to_path_buf(),
+            rootfs_dir,
+            triple,
+            override_cc_with_cross,
+            volumes,
+            cmd,
+        }
+    }
+}
+
 /// Pushes an image with the given `tag` to the registry.
 ///
 /// # Errors
@@ -169,25 +277,39 @@ fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn()?;
+    let mut child = cmd.spawn().with_context(|| {
+        format!("failed to run command {cmd:?} for pushing the container image")
+    })?;
     info!("Pushing image with command: {cmd:?}");
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = child
+        .stdout
+        .take()
+        .unwrap_or_else(|| panic!("expected command {cmd:?} to have piped stdout"));
+    let stderr = child
+        .stderr
+        .take()
+        .unwrap_or_else(|| panic!("expected command {cmd:?} to have piped stderr"));
     thread::scope(|s| {
         s.spawn(|| {
             for line in BufReader::new(stdout).lines() {
-                let line = line.unwrap();
+                let line = line.unwrap_or_else(|e| {
+                    panic!("failed to retrieve the stdout line from command {cmd:?}: {e:?}")
+                });
                 info!("{line}");
             }
         });
         s.spawn(|| {
             for line in BufReader::new(stderr).lines() {
-                let line = line.unwrap();
+                let line = line.unwrap_or_else(|e| {
+                    panic!("failed to retrieve the stderr line from command {cmd:?}: {e:?}")
+                });
                 error!("{line}");
             }
         });
     });
-    let status = child.wait()?;
+    let status = child
+        .wait()
+        .with_context(|| format!("command {cmd:?} failed to start"))?;
     if !status.success() {
         return Err(anyhow!("failed to push a container image: {status}"));
     }
@@ -203,15 +325,18 @@ fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result
 ///
 /// * The image build was unsuccessful.
 /// * If any of the tags could not be pushed.
-fn build_container_image(
-    container_engine: &ContainerEngine,
-    args: BuildContainerImageArgs,
-) -> anyhow::Result<()> {
+fn build_container_image(args: BuildContainerImageArgs) -> anyhow::Result<()> {
     let BuildContainerImageArgs {
+        container_engine,
         no_cache,
         push,
         tags,
     } = args;
+
+    let container_engine = match container_engine {
+        Some(ref container_engine) => container_engine,
+        None => &ContainerEngine::autodetect()?,
+    };
 
     let mut cmd = Command::new(container_engine);
     cmd.current_dir("containers");
@@ -228,23 +353,40 @@ fn build_container_image(
     }
     info!("Building container image with command: {cmd:?}");
 
-    let mut child = cmd.spawn()?;
+    let mut child = cmd.spawn().with_context(|| {
+        format!("failed to run command {cmd:?} for bulding the container image")
+    })?;
     {
-        let mut stdin = child.stdin.take().expect("child should have piped stdin");
-        stdin.write_all(DOCKERFILE)?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .unwrap_or_else(|| panic!("expected command {cmd:?} to have piped stdin"));
+        stdin.write_all(DOCKERFILE).with_context(|| {
+            format!("failed to write the dockerfile content to stdin of command {cmd:?}")
+        })?;
     }
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = child
+        .stdout
+        .take()
+        .unwrap_or_else(|| panic!("expected command {cmd:?} to have piped stdout"));
+    let stderr = child
+        .stderr
+        .take()
+        .unwrap_or_else(|| panic!("expected command {cmd:?} to have piped stderr"));
     thread::scope(|s| {
         s.spawn(|| {
             for line in BufReader::new(stdout).lines() {
-                let line = line.unwrap();
+                let line = line.unwrap_or_else(|e| {
+                    panic!("failed to retrieve the stdout line from command {cmd:?}: {e:?}")
+                });
                 info!("{line}");
             }
         });
         s.spawn(|| {
             for line in BufReader::new(stderr).lines() {
-                let line = line.unwrap();
+                let line = line.unwrap_or_else(|e| {
+                    panic!("failed to retrieve the stderr line from command {cmd:?}: {e:?}");
+                });
                 // Use `info!` even for stderr. The most of stderr messages are
                 // progress-related logs from emerge, logging them with `error!`
                 // would be confusing.
@@ -252,7 +394,9 @@ fn build_container_image(
             }
         });
     });
-    let status = child.wait()?;
+    let status = child
+        .wait()
+        .with_context(|| format!("command {cmd:?} failed to start"))?;
     if !status.success() {
         return Err(anyhow!("failed to build container image: {status}"));
     }
@@ -275,177 +419,586 @@ fn build_container_image(
     }
 }
 
-#[derive(Parser)]
-struct RunArgs {
-    /// Container image to use.
-    #[arg(long, default_value = "ghcr.io/exein-io/icedragon:latest")]
-    pub container_image: OsString,
-
-    /// Additional volumes to mount to the container.
-    #[arg(long = "volume", short)]
-    pub volumes: Vec<OsString>,
-
-    /// The command to run inside the container.
-    #[arg(trailing_var_arg = true)]
-    pub cmd: Vec<OsString>,
-}
-
-/// Takes a `cmd`, representing a container engine, and adds `--env` arguments,
+/// Returns a vector of environment variables to use in the container spec,
 /// consisting of:
 ///
-/// * The current environment variables, except `PATH`, which should be
-///   inherited from the Dockerfile.
-/// * Additional variables defined by us:
+/// * The current environment variables, except ones like `HOME`, `PATH` etc.,
+///   which would break the containerized environment. We filter out variables
+///   prefixed by `CARGO` and `RUSTUP` to make sure that the Rust toolchain
+///   inside container is isolated, expecially when icedragon is launched with
+///   `cargo run`. Variables prefixed by `SSL` are filtered to make sure that
+///   ca-certificates from the container are used.
+/// * Additional variables defined by us to shape the behavior of compilers and
+///   making sure they perform a correct cross build for the given `target`:
+///   * `CARGO_BUILD_TARGET`, telling cargo what target to build for.
 ///   * `CXXFLAGS` and `LDFLAGS`, pointing to LLVM libc++ as a C++ stdlib, LLD
 ///     as a linker, compiler-rt as a runtime library and LLVM libunwind as
 ///     unwinder.
+///   * `PATH` including the directories of LLVM and Rust toolchains.
 ///   * `PKG_CONFIG_SYSROOT_DIR`, to point pkg-config to the sysroot.
-fn add_env_args(cmd: &mut Command, triple: &Triple) {
-    for (key, value) in env::vars_os() {
-        if key != "PATH" {
-            let mut env_arg = OsString::from("--env=");
-            env_arg.push(key);
-            env_arg.push("=");
-            env_arg.push(value);
-            cmd.arg(env_arg);
-        }
+///   * `RUSTUP_HOME` pointing to the directory with Rust toolchains.
+///   * `RUSTFLAGS` telling Rust to:
+///     * Use an appropriate clang wrapper as a linker.
+///     * Use the cross sysroot.
+///   * `CARGO_TARGET_{triple}_RUNNER`, pointing to a QEMU user-space emulator,
+///     if the host and target CPU targets are different.
+/// * If `override_cc_with_cross` is set, `CC` and `CXX` are set to point to
+///   the clang cross wrappers.
+fn prepare_env(triple: &Triple, override_cc_with_cross: bool) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = env::vars()
+        .filter_map(|(key, value)| {
+            if matches!(key.as_str(), "HOME" | "OLDPWD" | "PATH" | "PWD" | "USER")
+                || key.as_str().starts_with("CARGO")
+                || key.as_str().starts_with("RUSTUP")
+                || key.as_str().starts_with("SSL")
+            {
+                None
+            } else {
+                Some((key, value))
+            }
+        })
+        .collect();
+    env.extend_from_slice(&[
+        ("CARGO_BUILD_TARGET".to_owned(), format!("{triple}")),
+        ("CXXFLAGS".to_owned(), format!("{} --stdlib=libc++", env::var("CXXFLAGS").unwrap_or_default())),
+        ("LDFLAGS".to_owned(), format!("{} -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind", env::var("LDFLAGS").unwrap_or_default())),
+        ("PATH".to_owned(), format!("/root/.cargo/bin:/usr/lib/llvm/{LLVM_VERSION}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")),
+        ("PKG_CONFIG_SYSROOT_DIR".to_owned(), format!("/usr/{triple}")),
+        ("RUSTUP_HOME".to_owned(), "/root/.rustup".to_owned()),
+        ("RUSTFLAGS".to_owned(), format!("{} -C linker={triple}-clang -C link-arg=--sysroot=/usr/{triple}",
+            env::var("RUSTFLAGS").unwrap_or_default()
+        )),
+    ]);
+    if override_cc_with_cross {
+        env.extend_from_slice(&[
+            ("CC".to_owned(), format!("{triple}-clang")),
+            ("CXX".to_owned(), format!("{triple}-clang++")),
+        ]);
     }
-    cmd.arg("--env=CXXFLAGS=--stdlib=libc++");
-    cmd.arg("--env=LDFLAGS=-fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind");
-    cmd.arg(format!("--env=PKG_CONFIG_SYSROOT_DIR=/usr/{triple}"));
-    cmd.arg("--env=RUSTUP_HOME=/root/.rustup");
-
-    let mut rustflags_arg = OsString::from("--env=RUSTFLAGS=");
-    rustflags_arg.push(env::var_os("RUSTFLAGS").unwrap_or_default());
-    rustflags_arg.push(format!(
-        "-C linker={triple}-clang -C link-arg=--sysroot=/usr/{triple}"
-    ));
-    cmd.arg(rustflags_arg);
+    let Triple { architecture, .. } = triple;
+    if architecture != &target_lexicon::HOST.architecture {
+        let triple = triple.to_string().to_uppercase().replace('-', "_");
+        env.push((
+            format!("CARGO_TARGET_{triple}_RUNNER"),
+            format!("qemu-{architecture}"),
+        ));
+    }
+    env
 }
 
-/// Runs a command inside a container.
-///
-/// The main work done by this function is constructing a container engine
-/// call from the provided arguments. It does so by merging the following
-/// parts into a list or arguments:
-///
-/// * `container_engine`, wrapped by a `runner`, if provided.
-/// * Container engine options:
-///   * `--rm`, which removes the container after execution.
-///   * `-it`, if the `interactive` option is enabled.
-///   * Bind mount of the current directory as `/src` inside container
-///     (equivalent of `-v $(pwd):/src`).
-///   * Container image determined based on `cli_args`
-///   * Additional `container_engine_args` provided by a caller.
-/// * Provided `cmd_args` as a command to run inside a container.
-///
-/// Target `triple` is used to determine additional environment variables,
-fn run_container(
-    container_engine: &ContainerEngine,
-    interactive: bool,
-    triple: &Triple,
-    container_image: &OsStr,
-    container_engine_args: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd_args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+/// Returns a random string with the given `len`.
+fn rand_string(rng: &mut StdRng, len: usize) -> String {
+    rng.sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
+
+async fn download_layer(
+    client: OciClient,
+    mpb: MultiProgress,
+    reference: Reference,
+    layer: OciDescriptor,
+    layer_file: &Path,
 ) -> anyhow::Result<()> {
-    let mut bind_mount = env::current_dir()?.into_os_string();
-    bind_mount.push(":/src");
+    let mut layer_file = tokio::fs::File::create(&layer_file)
+        .await
+        .unwrap_or_else(|e| panic!("failed to open layer file: {layer_file:?}: {e:?}"));
 
-    let mut container = Command::new(container_engine);
-    container.arg("run");
-    add_env_args(&mut container, triple);
-    if interactive {
-        container.arg("-it");
-    }
-    container.args(["--rm", "-v"]).arg(&bind_mount);
-    for volume in volumes {
-        container.arg("-v");
-        container.arg(volume);
-    }
-    container
-        .args(["-w", "/src"])
-        .args(container_engine_args)
-        .arg(container_image)
-        .args(cmd_args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    info!("Running container with command: {container:?}");
+    let mut stream = client
+        .pull_blob_stream(&reference, &layer)
+        .await
+        .unwrap_or_else(|e| panic!("failed to stream the OCI layer of {reference}: {e:?}"));
 
-    let mut child = container.spawn()?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "failed to run command {:?}, exit code: {:?}",
-            container.get_args(),
-            status.code()
-        ))
+    // Why is `oci-spec` storing layer size as `i64`? No idea. ¯\_(ツ)_/¯
+    #[allow(clippy::cast_sign_loss)]
+    let content_length = stream.content_length.unwrap_or(layer.size as u64);
+
+    let pb = mpb.add(ProgressBar::new(content_length));
+    let pb_style =
+        ProgressStyle::with_template(PROGRESS_BAR_TEMPLATE)?.progress_chars(PROGRESS_BAR_CHARS);
+    pb.set_style(pb_style);
+    while let Some(res) = stream.next().await {
+        let chunk = res.unwrap();
+        layer_file.write_all(&chunk).await.unwrap();
+        pb.inc(chunk.len() as u64);
     }
+    pb.finish_and_clear();
+
+    Ok(())
+}
+
+/// Pulls the given `container_image` from the OCI registry.
+async fn pull_image(
+    ctx: &ContainerContext,
+    download_dir: &Path,
+    digest_file: &PathBuf,
+    container_image: &str,
+) -> anyhow::Result<Option<(String, Vec<PathBuf>)>> {
+    let config = OciClientConfig {
+        protocol: OciClientProtocol::Https,
+        ..Default::default()
+    };
+    let client = OciClient::new(config);
+    let reference: Reference = container_image
+        .parse()
+        .with_context(|| format!("failed to parse container image URI {container_image}"))?;
+
+    let (manifest, digest) = client
+        .pull_image_manifest(&reference, &OciRegistryAuth::Anonymous)
+        .await
+        .with_context(|| {
+            format!("failed to pull the manifest of container image {container_image}")
+        })?;
+
+    // Check if we have an up-to-date image fetched locally.
+    if digest_file.exists() {
+        let local_digest = tokio::fs::read_to_string(&digest_file)
+            .await
+            .with_context(|| format!("failed to read the local digest file {digest_file:?}"))?;
+        if local_digest == digest {
+            debug!(
+                "Image already up-to-date (local digest: {local_digest}, latest digest: {digest})"
+            );
+            return Ok(None);
+        }
+    }
+
+    info!("📥 Pulling image");
+    let mut layer_files = Vec::with_capacity(manifest.layers.len());
+    let mut download_tasks = JoinSet::new();
+
+    let mpb = MultiProgress::new();
+
+    for layer in manifest.layers {
+        let client = client.clone();
+        let reference = reference.clone();
+        let mpb = mpb.clone();
+
+        let layer_file = download_dir.join(&layer.digest);
+        layer_files.push(layer_file.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        download_tasks.spawn(async move {
+            let res = download_layer(client, mpb, reference, layer, &layer_file).await;
+            tx.send(res).await.unwrap_or_else(|e| {
+                panic!("failed to send the result of the download task: {e:?}")
+            });
+        });
+        rx.recv().await.unwrap()?;
+    }
+    download_tasks.join_all().await;
+
+    // Remove the outdated image.
+    if ctx.rootfs_dir.exists() {
+        tokio::fs::remove_dir_all(&ctx.rootfs_dir)
+            .await
+            .with_context(|| format!("failed to remove rootfs directory {:?}", &ctx.rootfs_dir))?;
+    }
+    tokio::fs::create_dir_all(&ctx.rootfs_dir)
+        .await
+        .with_context(|| format!("failed to create rootfs directory {:?}", &ctx.rootfs_dir))?;
+
+    Ok(Some((digest, layer_files)))
+}
+
+/// Unpacks `tarball` in `.tar.gz` format into `dest`.
+fn unpack_tarball<T, D>(tarball: T, dest: D) -> anyhow::Result<()>
+where
+    T: fmt::Debug + AsRef<Path>,
+    D: fmt::Debug + AsRef<Path>,
+{
+    let tarball = std::fs::File::open(&tarball)
+        .with_context(|| format!("failed to open the tarball {tarball:?}"))?;
+    let reader = std::io::BufReader::new(&tarball);
+    let stream = flate2::bufread::GzDecoder::new(reader);
+    let mut archive = tar::Archive::new(stream);
+    archive
+        .unpack(&dest)
+        .with_context(|| format!("failed to unpack tarball {tarball:?} into {dest:?}"))?;
+    Ok(())
+}
+
+fn unpack_image(
+    ctx: &ContainerContext,
+    download_dir: &PathBuf,
+    layer_files: impl IntoIterator<Item = PathBuf>,
+) -> anyhow::Result<()> {
+    info!("📦 Unpacking image");
+    // NOTE(vadorovsky): You might be wondering why downloading is done in async
+    // Rust and unpacking is not. The reason is - there are multiple
+    // `tokio-tar` crates... and none of them is working properly:
+    //
+    // * `tokio-tar` and `krata-tokio-tar` are not able to unpack Python
+    //   artifacts, failing with errors like `failed to unpack [..]/__pycache__/t`.
+    //   Not sure what the issue is there, but might be related to symlinks.
+    // * `astral-tokio-tar` doesn't preserve the permissions and execute bits of
+    //   unpacked files.
+    //
+    // The upstream, non-async `tar` crate works just fine. Using it here is
+    // not ideal, we should definitely fix that at some poit.
+    //
+    // Overall, the most frustrating thing is that all the "async tar" crates
+    // are full forks, which end up broken and not up-to-date. There is a
+    // proposal of making a sans-io tar crate[0], which sounds like a good
+    // idea.
+    //
+    // The other way could be writing a collection of extension traits for
+    // types from the `tar` crate (like `Archive` or `Entry`) which work with
+    // async reader types, trying to re-use as much of the upstream logic as
+    // possible.
+    //
+    // [0] https://github.com/alexcrichton/tar-rs/issues/379
+    let (tx, rx) = mpsc::channel();
+    thread::scope(|s| {
+        for layer_file in layer_files {
+            let tx = tx.clone();
+            s.spawn(move || {
+                let res = unpack_tarball(&layer_file, &ctx.rootfs_dir);
+                tx.send(res).unwrap_or_else(|e| {
+                    panic!("failed to send the result of the unpacking thread: {e:?}")
+                });
+            });
+        }
+    });
+    rx.recv()??;
+
+    fs::remove_dir_all(download_dir)
+        .with_context(|| format!("failed to remove download directory {download_dir:?}"))?;
+
+    Ok(())
+}
+
+fn write_digest(digest_filename: &PathBuf, digest: &str) -> anyhow::Result<()> {
+    let mut digest_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(digest_filename)
+        .with_context(|| format!("failed to open the local digest file {digest_filename:?}"))?;
+    digest_file
+        .write_all(digest.as_bytes())
+        .with_context(|| format!("failed to write to the local digest file {digest_filename:?}"))?;
+    Ok(())
+}
+
+/// Prepares a rootfs for the container based on provided `container_image`.
+///
+/// The `{state_dir}/digest` file is used for storing the digest of the
+/// downloaded image. The image pull is skipped if the digest stored there is
+/// already up-to-date. Otherwise, it's updated after the successfull image
+/// pull.
+fn prepare_container(ctx: &ContainerContext, container_image: &str) -> anyhow::Result<()> {
+    let mut rng = StdRng::from_os_rng();
+    let download_dir = rand_string(&mut rng, 6);
+    let download_dir = Path::new("/tmp").join(download_dir);
+    fs::create_dir_all(&download_dir)
+        .with_context(|| format!("failed to create download directory {download_dir:?}"))?;
+
+    let digest_file = ctx.state_dir.join("digest");
+
+    if let Some((digest, layer_files)) = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the tokio runtime for pulling the container image")?
+        .block_on(pull_image(
+            ctx,
+            &download_dir,
+            &digest_file,
+            container_image,
+        ))?
+    {
+        unpack_image(ctx, &download_dir, layer_files)?;
+        write_digest(&digest_file, &digest)?;
+    }
+    Ok(())
+}
+
+/// Writes an ID mapping from the given `host_id` (representing a host user) to
+/// `0` (representing `root` inside container) to the given `map_file`.
+fn write_mapping(map_file: &Path, host_id: u32) -> anyhow::Result<()> {
+    debug!("Writing mapping to {map_file:?}");
+    let mapping = format!("0 {host_id} 1");
+    std::fs::write(map_file, mapping)
+        .with_context(|| format!("failed to write the ID mapping to file {map_file:?}"))?;
+    Ok(())
+}
+
+/// Writes UID and UID mappings from the host user to `0` (representing `root`
+/// inside container) for the given `pid`.
+fn write_mappings(pid: Pid) -> anyhow::Result<()> {
+    let proc_self = Path::new("/proc").join(pid.as_raw().to_string());
+    let setgroups_file = proc_self.join("setgroups");
+    std::fs::write(&setgroups_file, "deny")
+        .with_context(|| format!("failed to disable the use of `setgroups` syscall by writing to file {setgroups_file:?}"))?;
+    write_mapping(&proc_self.join("uid_map"), Uid::current().as_raw())
+        .context("failed to write UID mapping")?;
+    write_mapping(&proc_self.join("gid_map"), Gid::current().as_raw())
+        .context("failed to write GID mapping")?;
+    Ok(())
+}
+
+/// Mounts `procfs` inside `rootfs_dir`.
+fn proc_mount(rootfs_dir: &Path) -> anyhow::Result<()> {
+    debug!("Mounting /proc");
+    let dest = rootfs_dir.join("proc");
+    mount(
+        Some("proc"),
+        &dest,
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+        None::<&str>,
+    )
+    .with_context(|| format!("failed to mount proc filesystem into {dest:?}"))?;
+    Ok(())
+}
+
+/// Mounts `tmpfs` to `/dev` inside `rootfs_dir` and then selectivly mounts
+/// single devices that are essential for having a functional system. Some of
+/// them can be new mounts (`mqueue`, `pts`). Some of them need to be bind
+/// mounted from the host (`null`, `urandom` etc.).
+fn dev_mount(rootfs_dir: &Path) -> anyhow::Result<()> {
+    debug!("Mounting /dev");
+    let dev_path = rootfs_dir.join("dev");
+    mount(
+        Some("tmpfs"),
+        &dev_path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_STRICTATIME,
+        Some("mode=755,size=65536k"),
+    )
+    .with_context(|| format!("failed to mount tmpfs into {dev_path:?}"))?;
+    debug!("Mounting /dev/mqueue");
+    let mqueue_path = rootfs_dir.join("dev/mqueue");
+    if !mqueue_path.exists() {
+        fs::create_dir_all(&mqueue_path)?;
+    }
+    mount(
+        Some("mqueue"),
+        &mqueue_path,
+        Some("mqueue"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+        None::<&str>,
+    )
+    .with_context(|| format!("failed to mount mqueue into {mqueue_path:?}"))?;
+    debug!("Mounting /dev/pts");
+    let pts_path = rootfs_dir.join("dev/pts");
+    if !pts_path.exists() {
+        fs::create_dir_all(&pts_path)?;
+    }
+    mount(
+        Some("devpts"),
+        &pts_path,
+        Some("devpts"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        // Some("newinstance,ptmxmode=0666,mode=0620,gid=5"),
+        None::<&str>,
+    )
+    .with_context(|| format!("failed to mount devpts into {pts_path:?}"))?;
+    debug!("Mounting /dev/null");
+    bind_mount(rootfs_dir, "/dev/null", "/dev/null")?;
+    debug!("Mounting /dev/zero");
+    bind_mount(rootfs_dir, "/dev/zero", "/dev/zero")?;
+    debug!("Mounting /dev/full");
+    bind_mount(rootfs_dir, "/dev/full", "/dev/full")?;
+    debug!("Mounting /dev/tty");
+    bind_mount(rootfs_dir, "/dev/tty", "/dev/tty")?;
+    debug!("Mounting /dev/urandom");
+    bind_mount(rootfs_dir, "/dev/urandom", "/dev/urandom")?;
+    debug!("Mounting /dev/random");
+    bind_mount(rootfs_dir, "/dev/random", "/dev/random")?;
+    Ok(())
+}
+
+/// Bind mounts the given `src` into `dst` prefixed by `rootfs_dir`.
+fn bind_mount(
+    rootfs_dir: &Path,
+    src: impl AsRef<Path>,
+    dst: impl AsRef<Path>,
+) -> anyhow::Result<()> {
+    let mut full_dst = rootfs_dir.to_path_buf();
+    for component in dst.as_ref().components() {
+        // Pushing an absolute path with `/` to an existing `PathBuf`, replaces
+        // its old content entirely. That's not our intention - we want to
+        // merge `rootfs_dir` with `dst` even if `dst` is absolute.
+        if !matches!(component, Component::RootDir) {
+            full_dst.push(component);
+        }
+    }
+    if !full_dst.exists() {
+        if src.as_ref().is_dir() {
+            // When source is a directory, the destination has to be a
+            // directory as well.
+            fs::create_dir_all(&full_dst).with_context(|| {
+                format!("failed to create destination directory for bind mount {full_dst:?}")
+            })?;
+        } else {
+            // Otherwise, the destination has to be a regular file. It can be
+            // empty.
+            if let Some(parent) = full_dst.parent() {
+                fs::create_dir_all(parent).with_context(|| format!("failed to create parent directories {parent:?} for the bind mount destination file {full_dst:?}"))?;
+            }
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&full_dst)
+                .with_context(|| {
+                    format!("failed to create the bind mount destination file {full_dst:?}")
+                })?;
+        }
+    }
+
+    let src = src.as_ref();
+    debug!("Mounting {src:?} to {full_dst:?}");
+    mount(
+        Some(src),
+        &full_dst,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .with_context(|| format!("failed to bind mount {src:?} into {full_dst:?}"))?;
+    Ok(())
+}
+
+/// Mount filesystems into the `rootfs_dir`:
+///
+/// * `/proc`, see [`proc_mount`] for details.
+/// * `/dev`, see [`dev_mount`] for details.
+/// * `/src`, where we mount the current directory.
+/// * `/etc/resolv.conf`, which makes sure that resolving domains works insice
+///   container.
+/// * User-provided bind volumes.
+fn mount_volumes(ctx: &ContainerContext) -> anyhow::Result<()> {
+    proc_mount(&ctx.rootfs_dir)?;
+    dev_mount(&ctx.rootfs_dir)?;
+    bind_mount(&ctx.rootfs_dir, env::current_dir()?, "/src")
+        .context("failed to mount the current directory")?;
+    bind_mount(&ctx.rootfs_dir, "/etc/resolv.conf", "/etc/resolv.conf")?;
+    // Mount all the user-provided volumes.
+    for volume in &ctx.volumes {
+        let parts: Vec<&str> = volume.split(':').collect();
+        if parts.len() != 2 {
+            return Err(anyhow!("invalid volume format: {volume}"));
+        }
+        let (src, dst) = (parts[0], parts[1]);
+        bind_mount(&ctx.rootfs_dir, src, dst)
+            .context("failed to mount an user-provided directory")?;
+    }
+    Ok(())
+}
+
+fn container_child(ctx: &ContainerContext) -> anyhow::Result<Option<i32>> {
+    mount_volumes(ctx)?;
+    chroot(&ctx.rootfs_dir).context("`chroot` syscall failed")?;
+    chdir("/src").context("failed to change directory to `/src`")?;
+
+    let envs = prepare_env(&ctx.triple, ctx.override_cc_with_cross);
+
+    let mut cmd = ctx.cmd.command()?;
+    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    if ctx.interactive {
+        cmd.stdin(Stdio::inherit());
+    }
+    let status = cmd
+        .env_clear()
+        .envs(envs)
+        .spawn()
+        .with_context(|| format!("failed to run command {cmd:?} inside container"))?
+        .wait()
+        .with_context(|| format!("command {cmd:?} failed to start"))?;
+
+    Ok(status.code())
+}
+
+/// Runs a container, based on provided `cmd` and `rootfs_dir`.
+fn run_container(ctx: ContainerContext) -> anyhow::Result<()> {
+    // Channel for notifying the readiness of the child process, ensuring that
+    // UID/GID mapping is not written too early.
+    let (child_tx, child_rx) = ipc::channel()?;
+    // Channel for notifying about the readiness of UID/GID mapping, ensuring
+    // that `chroot` and the command are not called before it's done.
+    let (id_map_tx, id_map_rx) = ipc::channel()?;
+    let (res_tx, res_rx) = ipc::channel()?;
+
+    // Spawn a separate process with new namespaces and in our sysroot.
+    let mut child_stack = vec![0; 1024 * 1024];
+    // SAFETY: We use `clone` only to spawn a new process, which uses entirely
+    // safe Rust and `ipc-channel`. The `child_stack` is a safely allocated and
+    // zeroed buffer.
+    let pid = unsafe {
+        clone(
+            Box::new(move || {
+                child_tx
+                    .send(())
+                    .expect("failed to notify the parent process about readiness");
+                id_map_rx.recv().expect("failed to retrieve the message about readiness of UID/GID mappings from the parent process");
+                let res = container_child(&ctx).map_err(|e| serde_error::Error::new(&*e));
+                res_tx
+                    .send(res)
+                    .expect("failed to send child result to the channel");
+
+                0
+            }),
+            &mut child_stack,
+            CloneFlags::CLONE_NEWNS
+                | CloneFlags::CLONE_NEWIPC
+                | CloneFlags::CLONE_NEWCGROUP
+                | CloneFlags::CLONE_NEWPID
+                | CloneFlags::CLONE_NEWUSER
+                | CloneFlags::CLONE_NEWUTS,
+            None,
+        )?
+    };
+
+    // mount_volumes(rootfs_dir, volumes.clone())?;
+
+    child_rx
+        .recv()
+        .context("failed to receive the message about readiness of the child process")?;
+    write_mappings(pid)?;
+    id_map_tx.send(())?;
+
+    let exit_code = res_rx
+        .recv()?
+        .context("containerized process failed with an error")?;
+    if let Some(exit_code) = exit_code {
+        process::exit(exit_code);
+    }
+
+    Ok(())
 }
 
 /// Runs cargo inside a container.
 fn cargo(
-    container_engine: &ContainerEngine,
-    triple: &Triple,
-    container_image: &OsStr,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd: &mut OsVecDeque,
+    state_dir: &Path,
+    triple: Triple,
+    container_image: &str,
+    volumes: Vec<String>,
+    mut cmd: OsVecDeque,
 ) -> anyhow::Result<()> {
-    // Pass additional environment variables:
-    //
-    // * `CARGO_BUILD_TARGET`, pointing to our target.
-    // * `CARGO_TARGET_*_RUNNER`, defined only for foreigh architectures,
-    //    referencing the user-space emulator (QEMU) as a runner.
-    // * `CC` and `CXX`, used by `cc-rs` and many build systems, which might
-    //   potentially get called by build.rs of various crates, to determine a
-    //   C/C++ compiler to use. Set them to the clang wrappers.
-    // * `RUSTFLAGS`, which we extend, pointing Rust to an appropriate clang
-    //   wrapper as a linker and to a cross sysroot.
-    // * `RUSTUP_HOME`, which points to the directory with toolchains inside the
-    //   container filesystem.
-    let mut rustflags_arg = OsString::from("--env=RUSTFLAGS=");
-    rustflags_arg.push(env::var_os("RUSTFLAGS").unwrap_or_default());
-    rustflags_arg.push(format!(
-        "-C linker={triple}-clang -C link-arg=--sysroot=/usr/{triple}"
-    ));
-    let mut container_engine_args = OsVecDeque::with_capacity(4);
-    container_engine_args.push_back(format!("--env=CARGO_BUILD_TARGET={triple}"));
-    // If the target CPU architecture is different, use the user-space emulator
-    // (QEMU) as a runner.
-    let Triple { architecture, .. } = triple;
-    if architecture != &target_lexicon::HOST.architecture {
-        let triple = triple.to_string().to_uppercase().replace('-', "_");
-        container_engine_args.push_back(format!(
-            "--env=CARGO_TARGET_{triple}_RUNNER=qemu-{architecture}"
-        ));
-    }
-    container_engine_args.push_back(format!("--env=CC={triple}-clang"));
-    container_engine_args.push_back(format!("--env=CXX={triple}-clang++"));
-    container_engine_args.push_back(rustflags_arg);
-
     // The command is `cargo` followed by arguments provided by the caller.
     cmd.push_front("cargo");
 
-    run_container(
-        container_engine,
+    run(
         false,
+        state_dir,
         triple,
+        true,
         container_image,
-        container_engine_args.iter(),
         volumes,
-        cmd.iter(),
+        cmd,
     )
 }
 
 /// Runs clang inside a container.
 fn clang(
-    container_engine: &ContainerEngine,
-    triple: &Triple,
-    container_image: &OsStr,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd: &mut OsVecDeque,
+    state_dir: &Path,
+    triple: Triple,
+    container_image: &str,
+    volumes: Vec<String>,
+    mut cmd: OsVecDeque,
 ) -> anyhow::Result<()> {
     // The command is a clang wrapper (e.g. `aarch64-unknown-linux-musl-clang`)
     // followed by arguments provided by the caller.
@@ -466,14 +1019,14 @@ fn clang(
     };
     cmd.push_front(clang_cmd);
 
-    run_container(
-        container_engine,
+    run(
         false,
+        state_dir,
         triple,
+        true,
         container_image,
-        iter::empty::<OsString>(),
         volumes,
-        cmd.iter(),
+        cmd,
     )
 }
 
@@ -481,11 +1034,11 @@ fn clang(
 /// project, adds parameters necessary for cross-compilation for the given
 /// target.
 fn cmake(
-    container_engine: &ContainerEngine,
-    triple: &Triple,
-    container_image: &OsStr,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd: &mut OsVecDeque,
+    state_dir: &Path,
+    triple: Triple,
+    container_image: &str,
+    volumes: Vec<String>,
+    mut cmd: OsVecDeque,
 ) -> anyhow::Result<()> {
     // Determine whether we are configuring a CMake project.
     //
@@ -541,34 +1094,39 @@ fn cmake(
         cmd.push_back(format!("-DCMAKE_SYSROOT=/usr/{triple}"));
     }
 
-    run_container(
-        container_engine,
+    run(
         false,
+        state_dir,
         triple,
+        false,
         container_image,
-        iter::empty::<OsString>(),
         volumes,
-        cmd.iter(),
+        cmd,
     )
 }
 
 /// Run a command inside a container.
 fn run(
-    container_engine: &ContainerEngine,
-    triple: &Triple,
-    container_image: &OsStr,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    interactive: bool,
+    state_dir: &Path,
+    triple: Triple,
+    override_cc_with_cross: bool,
+    container_image: &str,
+    volumes: Vec<String>,
+    cmd: OsVecDeque,
 ) -> anyhow::Result<()> {
-    run_container(
-        container_engine,
-        true,
+    let ctx = ContainerContext::new(
+        interactive,
+        state_dir,
         triple,
-        container_image,
-        iter::empty::<OsString>(),
+        override_cc_with_cross,
         volumes,
         cmd,
-    )
+    );
+    prepare_container(&ctx, container_image)?;
+    run_container(ctx)?;
+
+    Ok(())
 }
 
 /// Parses and validates the given `target` triple.
@@ -605,39 +1163,48 @@ fn parse_target(target: Option<&str>) -> anyhow::Result<Triple> {
     Ok(triple)
 }
 
+/// Expands a tilde with a home directory in the given path.
+fn expand_tilde<P: AsRef<Path>>(p: P) -> anyhow::Result<PathBuf> {
+    let p = p.as_ref();
+    if p.starts_with("~") {
+        let mut home = match env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => bail!("the current user has no HOME directory"),
+        };
+        if !p.ends_with("~") {
+            home.extend(p.components().skip(1));
+        }
+        Ok(home)
+    } else {
+        Ok(p.to_path_buf())
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Cli {
         command,
-        container_engine,
+        state_dir,
         target,
     } = cli;
 
-    let container_engine = match container_engine {
-        Some(ref container_engine) => container_engine,
-        None => &ContainerEngine::autodetect()?,
-    };
-
+    let state_dir = expand_tilde(state_dir)?;
+    fs::create_dir_all(&state_dir)
+        .with_context(|| format!("failed to create state directory {state_dir:?}"))?;
     let triple = parse_target(target.as_deref())?;
 
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
     match command {
-        Commands::BuildContainerImage(args) => build_container_image(container_engine, args),
+        Commands::BuildContainerImage(args) => build_container_image(args),
         Commands::Cargo(args) => {
             let RunArgs {
                 container_image,
                 volumes,
                 cmd,
             } = args;
-            cargo(
-                container_engine,
-                &triple,
-                &container_image,
-                &volumes,
-                &mut cmd.into(),
-            )
+            cargo(&state_dir, triple, &container_image, volumes, cmd.into())
         }
         Commands::Clang(args) => {
             let RunArgs {
@@ -645,13 +1212,7 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
-            clang(
-                container_engine,
-                &triple,
-                &container_image,
-                &volumes,
-                &mut cmd.into(),
-            )
+            clang(&state_dir, triple, &container_image, volumes, cmd.into())
         }
         Commands::Cmake(args) => {
             let RunArgs {
@@ -659,13 +1220,7 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
-            cmake(
-                container_engine,
-                &triple,
-                &container_image,
-                &volumes,
-                &mut cmd.into(),
-            )
+            cmake(&state_dir, triple, &container_image, volumes, cmd.into())
         }
         Commands::Run(args) => {
             let RunArgs {
@@ -673,7 +1228,15 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
-            run(container_engine, &triple, &container_image, &volumes, &cmd)
+            run(
+                true,
+                &state_dir,
+                triple,
+                false,
+                &container_image,
+                volumes,
+                cmd.into(),
+            )
         }
     }
 }
@@ -739,5 +1302,19 @@ mod test {
         ]
         .into();
         assert!(!args.contains_any(cmake_action_args));
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        env::set_var("HOME", "/home/test");
+        assert_eq!(expand_tilde("~").unwrap(), PathBuf::from("/home/test"));
+        assert_eq!(
+            expand_tilde("~/foo").unwrap(),
+            PathBuf::from("/home/test/foo")
+        );
+        assert_eq!(
+            expand_tilde("~/foo/bar").unwrap(),
+            PathBuf::from("/home/test/foo/bar")
+        );
     }
 }
