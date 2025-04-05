@@ -2,21 +2,45 @@ use std::{
     collections::{vec_deque::Iter, VecDeque},
     env,
     ffi::{OsStr, OsString},
-    io::{BufRead as _, BufReader, Write as _},
+    io::{Read, Write as _},
     iter,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::Stdio,
+    rc::Rc,
     str::FromStr as _,
-    thread,
 };
 
-use anyhow::{anyhow, Context as _};
+use anyhow::{anyhow, bail, Context as _};
+use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand, ValueEnum};
+use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
+use libcontainer::{
+    container::builder::ContainerBuilder, syscall::syscall::SyscallType,
+    workload::default::DefaultExecutor,
+};
 use log::{error, info};
+use oci_client::{
+    client::{ClientConfig as OciClientConfig, ClientProtocol as OciClientProtocol},
+    manifest::OciManifest,
+    secrets::RegistryAuth as OciRegistryAuth,
+    Client as OciClient, Reference,
+};
+use rand::{distr::Alphanumeric, rngs::StdRng, Rng as _, SeedableRng as _};
 use target_lexicon::{Architecture, Environment, OperatingSystem, Triple};
+use tokio::{
+    fs::{self, File},
+    io::{AsyncBufRead, AsyncBufReadExt as _, AsyncRead, AsyncWriteExt, BufReader, BufWriter},
+    process::Command,
+    task::JoinSet,
+};
+use tokio_stream::StreamExt as _;
+use tokio_tar::Archive;
 use which::which;
 
 /// Content of the dockerfile.
 const DOCKERFILE: &[u8] = include_bytes!("../containers/Dockerfile");
+/// Content of the OCI configuration.
+const OCI_CONFIG: &[u8] = include_bytes!("../containers/config.json");
 
 /// A wrapper over [`VecDeque`] making it easy to gather platform-native
 /// strings.
@@ -70,6 +94,10 @@ struct Cli {
     /// Container engine (if not provided, is going to be autodetected).
     #[arg(global = true, long)]
     container_engine: Option<ContainerEngine>,
+
+    /// Directory where the internal state is stored.
+    #[arg(global = true, long, default_value = "~/.icedragon")]
+    state_dir: OsString,
 
     /// Target triple.
     #[arg(global = true, long)]
@@ -162,7 +190,7 @@ struct BuildContainerImageArgs {
 /// # Errors
 ///
 /// Returns an error if the push was not successful.
-fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result<()> {
+async fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result<()> {
     let mut cmd = Command::new(container_engine);
     cmd.arg("push")
         .arg(tag)
@@ -173,21 +201,29 @@ fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result
     info!("Pushing image with command: {cmd:?}");
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    thread::scope(|s| {
-        s.spawn(|| {
-            for line in BufReader::new(stdout).lines() {
-                let line = line.unwrap();
-                info!("{line}");
+    tokio::spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => info!("{line}"),
+                Ok(None) => break,
+                Err(e) => error!("Failed to read stdout: {e}"),
             }
-        });
-        s.spawn(|| {
-            for line in BufReader::new(stderr).lines() {
-                let line = line.unwrap();
-                error!("{line}");
-            }
-        });
+        }
     });
-    let status = child.wait()?;
+    tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => error!("{line}"),
+                Ok(None) => break,
+                Err(e) => error!("Failed to read stderr: {e}"),
+            }
+        }
+    });
+    let status = child.wait().await?;
     if !status.success() {
         return Err(anyhow!("failed to push a container image: {status}"));
     }
@@ -203,7 +239,7 @@ fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result
 ///
 /// * The image build was unsuccessful.
 /// * If any of the tags could not be pushed.
-fn build_container_image(
+async fn build_container_image(
     container_engine: &ContainerEngine,
     args: BuildContainerImageArgs,
 ) -> anyhow::Result<()> {
@@ -231,28 +267,36 @@ fn build_container_image(
     let mut child = cmd.spawn()?;
     {
         let mut stdin = child.stdin.take().expect("child should have piped stdin");
-        stdin.write_all(DOCKERFILE)?;
+        stdin.write_all(DOCKERFILE).await?;
     }
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    thread::scope(|s| {
-        s.spawn(|| {
-            for line in BufReader::new(stdout).lines() {
-                let line = line.unwrap();
-                info!("{line}");
+    tokio::spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => info!("{line}"),
+                Ok(None) => break,
+                Err(e) => error!("Failed to read stdout: {e}"),
             }
-        });
-        s.spawn(|| {
-            for line in BufReader::new(stderr).lines() {
-                let line = line.unwrap();
+        }
+    });
+    tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        loop {
+            match lines.next_line().await {
                 // Use `info!` even for stderr. The most of stderr messages are
                 // progress-related logs from emerge, logging them with `error!`
                 // would be confusing.
-                info!("{line}");
+                Ok(Some(line)) => info!("{line}"),
+                Ok(None) => break,
+                Err(e) => error!("Failed to read stderr: {e}"),
             }
-        });
+        }
     });
-    let status = child.wait()?;
+    let status = child.wait().await?;
     if !status.success() {
         return Err(anyhow!("failed to build container image: {status}"));
     }
@@ -261,6 +305,7 @@ fn build_container_image(
     if push {
         for tag in &tags {
             if let Err(e) = push_image(container_engine, tag)
+                .await
                 .with_context(|| format!("failed to push the tag {tag:?}"))
             {
                 errors.push(e);
@@ -279,7 +324,7 @@ fn build_container_image(
 struct RunArgs {
     /// Container image to use.
     #[arg(long, default_value = "ghcr.io/exein-io/icedragon:latest")]
-    pub container_image: OsString,
+    pub container_image: String,
 
     /// Additional volumes to mount to the container.
     #[arg(long = "volume", short)]
@@ -323,6 +368,111 @@ fn add_env_args(cmd: &mut Command, triple: &Triple) {
     cmd.arg(rustflags_arg);
 }
 
+async fn pull_image(
+    rng: &mut StdRng,
+    rootfs_dir: &PathBuf,
+    container_image: &str,
+) -> anyhow::Result<()> {
+    let config = OciClientConfig {
+        protocol: OciClientProtocol::Https,
+        ..Default::default()
+    };
+    let client = OciClient::new(config);
+    let reference: Reference = container_image.parse()?;
+
+    let layers_dir: String = rng
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let layers_dir = PathBuf::from(format!("/tmp/icedragon-{layers_dir}"));
+
+    fs::create_dir_all(&layers_dir).await?;
+
+    info!("📥 Pulling image");
+    let (manifest, digest) = client
+        .pull_image_manifest(&reference, &OciRegistryAuth::Anonymous)
+        .await?;
+
+    let mut layer_files = Vec::with_capacity(manifest.layers.len());
+    let mut download_tasks = JoinSet::new();
+
+    let mpb = MultiProgress::new();
+
+    for layer in manifest.layers {
+        let client = client.clone();
+        let reference = reference.clone();
+        let mpb = mpb.clone();
+        let pb_style = ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
+        .progress_chars("#>-");
+
+        let layer_file = layers_dir.join(&layer.digest);
+        layer_files.push(layer_file.clone());
+
+        download_tasks.spawn(async move {
+            let mut layer_file = File::create(layer_file).await.unwrap();
+
+            let mut stream = client.pull_blob_stream(&reference, &layer).await.unwrap();
+
+            let content_length = stream.content_length.unwrap_or_else(|| layer.size as u64);
+            let pb = mpb.add(ProgressBar::new(content_length));
+            pb.set_style(pb_style.clone());
+            while let Some(res) = stream.next().await {
+                let chunk = res.unwrap();
+                layer_file.write(&chunk).await.unwrap();
+                pb.inc(chunk.len() as u64);
+            }
+            pb.finish_and_clear();
+        });
+    }
+    download_tasks.join_all().await;
+
+    fs::create_dir_all(&rootfs_dir).await?;
+
+    info!("📦 Unpacking image");
+    // let mut unpack_tasks = JoinSet::new();
+    // for layer_file in layer_files {
+    //     let rootfs_dir = rootfs_dir.clone();
+    //     unpack_tasks.spawn(async move {
+    //         let layer_file = File::open(layer_file).await.unwrap();
+    //         let reader = BufReader::new(layer_file);
+    //         let stream = GzipDecoder::new(reader);
+    //         let mut archive = Archive::new(stream);
+    //         archive.unpack(&rootfs_dir).await.unwrap();
+    //     });
+    // }
+    // unpack_tasks.join_all().await;
+    tokio::task::spawn_blocking({
+        let rootfs_dir = rootfs_dir.clone();
+        move || {
+            for layer_file in layer_files {
+                let layer_file = std::fs::File::open(layer_file).unwrap();
+                let reader = std::io::BufReader::new(layer_file);
+                let stream = flate2::bufread::GzDecoder::new(reader);
+                let mut archive = tar::Archive::new(stream);
+                archive.unpack(&rootfs_dir).unwrap();
+            }
+        }
+    })
+    .await?;
+
+    info!("layerz dir: {layers_dir:?}");
+    // fs::remove_dir_all(&layers_dir).await?;
+
+    Ok(())
+}
+
+async fn create_bundle(bundle_dir: &PathBuf) -> anyhow::Result<()> {
+    fs::create_dir_all(bundle_dir).await?;
+    let config_file = bundle_dir.join("config.json");
+    let config_file = File::create(config_file).await?;
+    let mut writer = BufWriter::new(config_file);
+    writer.write_all(OCI_CONFIG).await?;
+    writer.flush().await?;
+
+    Ok(())
+}
+
 /// Runs a command inside a container.
 ///
 /// The main work done by this function is constructing a container engine
@@ -340,56 +490,62 @@ fn add_env_args(cmd: &mut Command, triple: &Triple) {
 /// * Provided `cmd_args` as a command to run inside a container.
 ///
 /// Target `triple` is used to determine additional environment variables,
-fn run_container(
+async fn run_container(
     container_engine: &ContainerEngine,
     interactive: bool,
+    state_dir: &PathBuf,
     triple: &Triple,
-    container_image: &OsStr,
+    container_image: &str,
     container_engine_args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
     cmd_args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> anyhow::Result<()> {
-    let mut bind_mount = env::current_dir()?.into_os_string();
-    bind_mount.push(":/src");
+    let bundle_dir = state_dir.join("bundle");
+    if !bundle_dir.exists() {
+        create_bundle(&bundle_dir).await?;
+    }
 
-    let mut container = Command::new(container_engine);
-    container.arg("run");
-    add_env_args(&mut container, triple);
-    if interactive {
-        container.arg("-it");
-    }
-    container.args(["--rm", "-v"]).arg(&bind_mount);
-    for volume in volumes {
-        container.arg("-v");
-        container.arg(volume);
-    }
-    container
-        .args(["-w", "/src"])
-        .args(container_engine_args)
-        .arg(container_image)
-        .args(cmd_args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    info!("Running container with command: {container:?}");
+    let mut rng = StdRng::from_os_rng();
 
-    let mut child = container.spawn()?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "failed to run command {:?}, exit code: {:?}",
-            container.get_args(),
-            status.code()
-        ))
+    let rootfs_dir = bundle_dir.join("rootfs");
+    if !rootfs_dir.exists() {
+        pull_image(&mut rng, &rootfs_dir, container_image).await?;
     }
+
+    let container_id: String = rng
+        .sample_iter(&Alphanumeric)
+        .take(5)
+        .map(char::from)
+        .collect();
+    let container_id = format!("icdrgn-{container_id}");
+
+    tokio::task::spawn_blocking({
+        move || {
+            let mut container = ContainerBuilder::new(container_id, SyscallType::Linux)
+                .with_executor(DefaultExecutor {})
+                .with_root_path(&rootfs_dir)
+                .unwrap()
+                .validate_id()
+                .unwrap()
+                .as_init(&bundle_dir)
+                .with_systemd(false)
+                .build()
+                .unwrap();
+
+            container.start().unwrap();
+        }
+    })
+    .await?;
+
+    Ok(())
 }
 
 /// Runs cargo inside a container.
-fn cargo(
+async fn cargo(
     container_engine: &ContainerEngine,
+    state_dir: &PathBuf,
     triple: &Triple,
-    container_image: &OsStr,
+    container_image: &str,
     volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
     cmd: &mut OsVecDeque,
 ) -> anyhow::Result<()> {
@@ -431,19 +587,22 @@ fn cargo(
     run_container(
         container_engine,
         false,
+        state_dir,
         triple,
         container_image,
         container_engine_args.iter(),
         volumes,
         cmd.iter(),
     )
+    .await
 }
 
 /// Runs clang inside a container.
-fn clang(
+async fn clang(
     container_engine: &ContainerEngine,
+    state_dir: &PathBuf,
     triple: &Triple,
-    container_image: &OsStr,
+    container_image: &str,
     volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
     cmd: &mut OsVecDeque,
 ) -> anyhow::Result<()> {
@@ -469,21 +628,24 @@ fn clang(
     run_container(
         container_engine,
         false,
+        state_dir,
         triple,
         container_image,
         iter::empty::<OsString>(),
         volumes,
         cmd.iter(),
     )
+    .await
 }
 
 /// Runs `CMake` inside a container. If the command involves configuring a
 /// project, adds parameters necessary for cross-compilation for the given
 /// target.
-fn cmake(
+async fn cmake(
     container_engine: &ContainerEngine,
+    state_dir: &PathBuf,
     triple: &Triple,
-    container_image: &OsStr,
+    container_image: &str,
     volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
     cmd: &mut OsVecDeque,
 ) -> anyhow::Result<()> {
@@ -544,31 +706,36 @@ fn cmake(
     run_container(
         container_engine,
         false,
+        state_dir,
         triple,
         container_image,
         iter::empty::<OsString>(),
         volumes,
         cmd.iter(),
     )
+    .await
 }
 
 /// Run a command inside a container.
-fn run(
+async fn run(
     container_engine: &ContainerEngine,
+    state_dir: &PathBuf,
     triple: &Triple,
-    container_image: &OsStr,
+    container_image: &str,
     volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
     cmd: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> anyhow::Result<()> {
     run_container(
         container_engine,
         true,
+        state_dir,
         triple,
         container_image,
         iter::empty::<OsString>(),
         volumes,
         cmd,
     )
+    .await
 }
 
 /// Parses and validates the given `target` triple.
@@ -605,11 +772,29 @@ fn parse_target(target: Option<&str>) -> anyhow::Result<Triple> {
     Ok(triple)
 }
 
-fn main() -> anyhow::Result<()> {
+fn expand_tilde<P: AsRef<Path>>(p: P) -> anyhow::Result<PathBuf> {
+    let p = p.as_ref();
+    if p.starts_with("~") {
+        let mut home = match env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => bail!("the current user has no HOME directory"),
+        };
+        if !p.ends_with("~") {
+            home.extend(p.components().skip(1));
+        }
+        Ok(home)
+    } else {
+        Ok(p.to_path_buf())
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Cli {
         command,
         container_engine,
+        state_dir,
         target,
     } = cli;
 
@@ -617,14 +802,15 @@ fn main() -> anyhow::Result<()> {
         Some(ref container_engine) => container_engine,
         None => &ContainerEngine::autodetect()?,
     };
-
+    let state_dir = expand_tilde(state_dir)?;
+    fs::create_dir_all(&state_dir).await?;
     let triple = parse_target(target.as_deref())?;
 
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
     match command {
-        Commands::BuildContainerImage(args) => build_container_image(container_engine, args),
+        Commands::BuildContainerImage(args) => build_container_image(container_engine, args).await,
         Commands::Cargo(args) => {
             let RunArgs {
                 container_image,
@@ -633,11 +819,13 @@ fn main() -> anyhow::Result<()> {
             } = args;
             cargo(
                 container_engine,
+                &state_dir,
                 &triple,
                 &container_image,
                 &volumes,
                 &mut cmd.into(),
             )
+            .await
         }
         Commands::Clang(args) => {
             let RunArgs {
@@ -647,11 +835,13 @@ fn main() -> anyhow::Result<()> {
             } = args;
             clang(
                 container_engine,
+                &state_dir,
                 &triple,
                 &container_image,
                 &volumes,
                 &mut cmd.into(),
             )
+            .await
         }
         Commands::Cmake(args) => {
             let RunArgs {
@@ -661,11 +851,13 @@ fn main() -> anyhow::Result<()> {
             } = args;
             cmake(
                 container_engine,
+                &state_dir,
                 &triple,
                 &container_image,
                 &volumes,
                 &mut cmd.into(),
             )
+            .await
         }
         Commands::Run(args) => {
             let RunArgs {
@@ -673,7 +865,15 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
-            run(container_engine, &triple, &container_image, &volumes, &cmd)
+            run(
+                container_engine,
+                &state_dir,
+                &triple,
+                &container_image,
+                &volumes,
+                &cmd,
+            )
+            .await
         }
     }
 }
