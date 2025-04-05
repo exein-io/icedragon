@@ -79,6 +79,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      # AppArmor, which is used on GitHub runners, prevents icedragon from
+      # calling `unshare` as an unprivileged used.
+      # TODO(vadorovsky): Write an AppArmor profile.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       # Integration tests perform cross builds of different projects. Run each
       # of them separately, so each build can utilize all the cores. Gather
       # their output for easier debugging of failed CI builds.
