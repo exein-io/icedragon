@@ -23,20 +23,35 @@ anyhow = { version = "1.0.89", default-features = false }
 chrono = { version = "0.4", default-features = false }
 clap = { version = "4.5", default-features = false, features = ["derive", "help", "std"] }
 env_logger = { version = "0.11", default-features = false }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+indicatif = { version = "0.17", default-features = false }
+ipc-channel = { version = "0.19", default-features = false }
 log = { version = "0.4", default-features = false }
+nix = { version = "0.29.0", default-features = false, features = ["event", "fs", "mount", "sched", "user"] }
+oci-client = { version = "0.14", default-features = false, features = ["rustls-tls"] }
+rand = { version = "0.9", default-features = false, features = ["os_rng", "std_rng"] }
+serde-error = { version = "0.1", default-features = false }
 target-lexicon = { version = "0.12", default-features = false }
+tar = { version = "0.4", default-features = false }
 thiserror = { version = "1.0.64", default-features = false }
+tokio = { version = "1.44", default-features = false, features = ["process", "rt-multi-thread"] }
+tokio-stream = { version = "0.1", default-features = false }
 uuid = { version = "1.10", default-features = false, features = ["v4"] }
 which = { version = "6.0", default-features = false }
 
 [dev-dependencies]
-flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 goblin = { version = "0.9", default-features = false, features = ["elf32", "elf64", "endian_fd", "std"] }
 liblzma = { version = "0.3", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 tar = { version = "0.4", default-features = false }
 tempfile = { version = "3.16", default-features = false }
 test-case = { version = "3.3", default-features = false }
+
+[patch.crates-io]
+# Fix which makes it possible to use rootless libcontainer without systemd:
+# https://github.com/youki-dev/youki/issues/3144
+# https://github.com/youki-dev/youki/pull/3146
+libcontainer = { git = "https://github.com/vadorovsky/youki", branch = "cgroupfs-rootless-warning" }
 
 [[bin]]
 name = "icedragon"

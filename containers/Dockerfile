@@ -97,6 +97,7 @@ RUN emerge-webrsync \
     && emerge \
         app-emulation/qemu \
         app-eselect/eselect-repository \
+        dev-debug/strace \
         dev-vcs/git \
         llvm-runtimes/libgcc \
         sys-devel/crossdev \
