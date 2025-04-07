@@ -58,7 +58,7 @@ where
     let reader = BufReader::new(&*bytes);
     let ext = url
         .split('.')
-        .last()
+        .next_back()
         .unwrap_or_else(|| panic!("tarball URL {url} should have a file extension"));
 
     if ext.eq_ignore_ascii_case("gz") {
