@@ -1,3 +1,0 @@
-# Disable the git functionality from eselect-repository. We don't need to use
-# any third-party overlays with git.
-app-eselect/eselect-repository -git

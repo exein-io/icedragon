@@ -13,10 +13,11 @@ ENV USE="static-libs"
 ENV QEMU_USER_TARGETS="aarch64 x86_64"
 
 COPY package.accept_keywords/* /etc/portage/package.accept_keywords/
-COPY package.use/* /etc/portage/package.use/
 
 # Install QEMU, which can be used for running foreign binaries and therefore is
 # useful for running `cargo test` for foreign targets.
+#
+# Install git, needed by cargo if there are any `git` dependencies specified.
 #
 # Install crossdev[0], which is a manager of cross sysroots, providing wrapper
 # for:
@@ -96,6 +97,7 @@ RUN emerge-webrsync \
     && emerge \
         app-emulation/qemu \
         app-eselect/eselect-repository \
+        dev-vcs/git \
         llvm-runtimes/libgcc \
         sys-devel/crossdev \
     && eselect repository create crossdev \
