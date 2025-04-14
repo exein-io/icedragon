@@ -135,6 +135,19 @@ where
     assert_eq!(elf.header.e_machine, elf_machine);
 }
 
+/// Tests whether binaries installed through `cargo install` are stored
+/// persistently.
+#[test]
+fn test_cargo_install() {
+    let hello_world_dir = env::current_dir().unwrap().join("tests/hello-world");
+    icedragon_cmd(&hello_world_dir, "cargo", None, &[])
+        .args(["install", "--path", "."])
+        .assert_success();
+    icedragon_cmd(&hello_world_dir, "run", None, &[])
+        .args(["hello-world", "--version"])
+        .assert_success();
+}
+
 /// Tests cargo support by cross-compiling pulsar.
 #[test_case("aarch64-unknown-linux-musl", elf_header::EM_AARCH64 ; "aarch64")]
 #[test_case("x86_64-unknown-linux-musl", elf_header::EM_X86_64 ; "x86_64")]
