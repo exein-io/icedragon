@@ -925,6 +925,16 @@ fn bind_mount(
     })
 }
 
+/// Resolves the home path of the current user.
+fn home_dir() -> anyhow::Result<PathBuf> {
+    // TODO: Remove this function and use `std::env::home_dir` once it's
+    // un-deprecated in a stable Rust release.
+    match env::var_os("HOME") {
+        Some(home) => Ok(PathBuf::from(home)),
+        None => Err(anyhow!("`HOME` environment variable is not set")),
+    }
+}
+
 /// Mount filesystems into the `rootfs_dir`:
 ///
 /// * `/proc`, see [`proc_mount`] for details.
@@ -939,6 +949,16 @@ fn mount_volumes(ctx: &ContainerContext) -> anyhow::Result<()> {
     bind_mount(&ctx.rootfs_dir, env::current_dir()?, "/src")
         .context("failed to mount the current directory")?;
     bind_mount(&ctx.rootfs_dir, "/etc/resolv.conf", "/etc/resolv.conf")?;
+    // Mount the directory with SSH keys (`$HOME/.ssh`) to be able to access
+    // private repositories.
+    let home_dir = home_dir()?;
+    let ssh_keys_dir = Path::new(&home_dir).join(".ssh");
+    if ssh_keys_dir.exists() {
+        bind_mount(&ctx.rootfs_dir, ssh_keys_dir, "/root/.ssh")?;
+    }
+    if let Some(ssh_auth_sock) = env::var_os("SSH_AUTH_SOCK") {
+        bind_mount(&ctx.rootfs_dir, &ssh_auth_sock, &ssh_auth_sock)?;
+    }
     // Mount all the user-provided volumes.
     for (src, dst) in &ctx.volumes {
         bind_mount(&ctx.rootfs_dir, src, dst)
@@ -1248,15 +1268,8 @@ fn expand_tilde(p: PathBuf) -> anyhow::Result<PathBuf> {
     //
     // Otherwise, just return the original path.
     if matches!(components.next(), Some(Component::Normal(first)) if first == "~") {
-        // Resolve the home path of the user.
-        // TODO: Use `std::env::home_dir` once it's un-deprecated in a stable
-        // Rust release.
-        // https://doc.rust-lang.org/nightly/std/env/fn.home_dir.html
-        let mut home = match env::var_os("HOME") {
-            Some(home) => PathBuf::from(home),
-            None => return Err(anyhow!("`HOME` environment variable is not set")),
-        };
-        // Extend it with all the following components.
+        let mut home = home_dir()?;
+        // Extend the home path with all the following components.
         home.extend(components);
         Ok(home)
     } else {
