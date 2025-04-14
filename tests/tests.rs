@@ -135,6 +135,19 @@ where
     assert_eq!(elf.header.e_machine, elf_machine);
 }
 
+/// Tests whether binaries installed through `cargo install` are stored
+/// persistently by installing `btfdump`.
+#[test]
+fn test_cargo_install_btfdump() {
+    let current_dir = env::current_dir().unwrap();
+    icedragon_cmd(&current_dir, "cargo", None, &[])
+        .args(["install", "btfdump"])
+        .assert_success();
+    icedragon_cmd(&current_dir, "run", None, &[])
+        .args(["btf", "--help"])
+        .assert_success();
+}
+
 /// Tests cargo support by cross-compiling pulsar.
 #[test_case("aarch64-unknown-linux-musl", elf_header::EM_AARCH64 ; "aarch64")]
 #[test_case("x86_64-unknown-linux-musl", elf_header::EM_X86_64 ; "x86_64")]
