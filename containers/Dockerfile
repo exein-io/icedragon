@@ -98,6 +98,7 @@ RUN emerge-webrsync \
         app-emulation/qemu \
         app-eselect/eselect-repository \
         app-misc/ca-certificates \
+        dev-libs/protobuf \
         dev-vcs/git \
         llvm-runtimes/libgcc \
         sys-devel/crossdev \
