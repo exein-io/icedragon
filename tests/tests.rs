@@ -56,7 +56,7 @@ where
     }
 }
 
-fn icedragon_cmd<P>(dir: P, subcommand: &str, target: &str) -> Command
+fn icedragon_cmd<P>(dir: P, subcommand: &str, target: Option<&str>) -> Command
 where
     P: AsRef<Path>,
 {
@@ -75,7 +75,10 @@ where
     cmd.env_clear()
         .envs(filtered_env)
         .current_dir(dir)
-        .args([subcommand, "--target", target]);
+        .arg(subcommand);
+    if let Some(target) = target {
+        cmd.args(["--target", target]);
+    }
     if let Some(container_image) = env::var_os("ICEDRAGON_CONTAINER_IMAGE") {
         cmd.arg("--container-image").arg(&container_image);
     }
@@ -117,12 +120,25 @@ where
     assert_eq!(elf.header.e_machine, elf_machine);
 }
 
+/// Tests whether binaries installed through `cargo install` are stored
+/// persistently by installing `btfdump`.
+#[test]
+fn test_cargo_install_btfdump() {
+    let current_dir = env::current_dir().unwrap();
+    icedragon_cmd(&current_dir, "cargo", None)
+        .args(["install", "btfdump"])
+        .assert_success();
+    icedragon_cmd(&current_dir, "run", None)
+        .args(["btf", "--help"])
+        .assert_success();
+}
+
 /// Tests cargo support by cross-compiling pulsar.
 #[test_case("aarch64-unknown-linux-musl", elf_header::EM_AARCH64 ; "aarch64")]
 #[test_case("x86_64-unknown-linux-musl", elf_header::EM_X86_64 ; "x86_64")]
 fn test_cargo_pulsar(target: &str, elf_machine: u16) {
     let dir = TEMPDIR.path().join("pulsar-0.9.0");
-    icedragon_cmd(&dir, "cargo", target)
+    icedragon_cmd(&dir, "cargo", Some(target))
         .arg("build")
         .assert_success();
     let bin_path = dir.join("target").join(target).join("debug/pulsar-exec");
@@ -147,7 +163,7 @@ fn test_cargo_pulsar(target: &str, elf_machine: u16) {
 fn test_cmake_compiler_rt(target: &str, arch: &str, elf_machine: u16, extra_args: &[&'static str]) {
     let dir = TEMPDIR.path().join("llvm-project-19.1.7.src");
     let build_dir = format!("build-{target}");
-    icedragon_cmd(&dir, "cmake", target)
+    icedragon_cmd(&dir, "cmake", Some(target))
         .args([
             "-S",
             "compiler-rt",
@@ -165,7 +181,7 @@ fn test_cmake_compiler_rt(target: &str, arch: &str, elf_machine: u16, extra_args
         ])
         .args(extra_args)
         .assert_success();
-    icedragon_cmd(&dir, "cmake", target)
+    icedragon_cmd(&dir, "cmake", Some(target))
         .args(["--build", &build_dir])
         .assert_success();
     let bin_filename = format!("clang_rt.crtbegin-{arch}.o");
