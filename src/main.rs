@@ -560,6 +560,14 @@ fn mounts(volumes: Vec<String>) -> anyhow::Result<Vec<Mount>> {
     // resolve domains.
     let resolv_mount = bind_mount("/etc/resolv.conf", "/etc/resolv.conf")?;
     mounts.push(resolv_mount);
+    // Mount the directory with SSH keys (`$HOME/.ssh`) to be able to access
+    // private repositories.
+    let home_dir = env::var_os("HOME").ok_or(anyhow!(
+        "cannot find the home directory, `HOME` environment variable is not defined"
+    ))?;
+    let ssh_keys_dir = Path::new(&home_dir).join(".ssh");
+    let ssh_keys_mount = bind_mount(ssh_keys_dir, "/root/.ssh")?;
+    mounts.push(ssh_keys_mount);
     // Mount all the user-provided volumes.
     for volume in volumes {
         let parts: Vec<&str> = volume.split(':').collect();
