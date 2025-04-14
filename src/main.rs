@@ -4,6 +4,7 @@ use std::{
     collections::VecDeque,
     env,
     ffi::{OsStr, OsString},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     str::FromStr as _,
@@ -551,7 +552,7 @@ fn bind_mount(src: impl Into<PathBuf>, dst: impl Into<PathBuf>) -> anyhow::Resul
 
 /// Returns mounts for the container - predefined defaults and the bind mounts
 /// based on user-provided `volumes`.
-fn mounts(volumes: Vec<String>) -> anyhow::Result<Vec<Mount>> {
+fn mounts(volumes: Vec<String>, cargo_dir: &Path, rustup_dir: &Path) -> anyhow::Result<Vec<Mount>> {
     let mut mounts = get_rootless_mounts();
     // Mount the current directory.
     let src_mount = bind_mount(env::current_dir()?, "/src")?;
@@ -568,6 +569,11 @@ fn mounts(volumes: Vec<String>) -> anyhow::Result<Vec<Mount>> {
     let ssh_keys_dir = Path::new(&home_dir).join(".ssh");
     let ssh_keys_mount = bind_mount(ssh_keys_dir, "/root/.ssh")?;
     mounts.push(ssh_keys_mount);
+    // Mount Rust toolchain.
+    let cargo_mount = bind_mount(cargo_dir, "/root/.cargo")?;
+    mounts.push(cargo_mount);
+    let rustup_mount = bind_mount(rustup_dir, "/root/.rustup")?;
+    mounts.push(rustup_mount);
     // Mount all the user-provided volumes.
     for volume in volumes {
         let parts: Vec<&str> = volume.split(':').collect();
@@ -584,6 +590,8 @@ fn mounts(volumes: Vec<String>) -> anyhow::Result<Vec<Mount>> {
 fn container_spec(
     interactive: bool,
     rootfs_dir: &Path,
+    cargo_dir: &Path,
+    rustup_dir: &Path,
     triple: &Triple,
     volumes: Vec<String>,
     cmd_args: impl Into<Vec<String>>,
@@ -605,7 +613,7 @@ fn container_spec(
         .build()?;
     let spec = SpecBuilder::default()
         .root(root)
-        .mounts(mounts(volumes)?)
+        .mounts(mounts(volumes, cargo_dir, rustup_dir)?)
         .process(process)
         .linux(linux_spec)
         .build()?;
@@ -621,7 +629,7 @@ async fn run_container(
 ) -> anyhow::Result<()> {
     let container_id = rand_string(rng, 5);
     let container_id = format!("icdrgn-{container_id}");
-    let container_task = tokio::task::spawn_blocking({
+    tokio::task::spawn_blocking({
         move || {
             let mut container = ContainerBuilder::new(container_id, SyscallType::Linux)
                 .with_executor(DefaultExecutor {})
@@ -638,8 +646,59 @@ async fn run_container(
             waitpid(container.pid().expect("container should have a pid"), None).unwrap();
             container.delete(true).unwrap();
         }
-    });
-    container_task.await?;
+    })
+    .await?;
+
+    Ok(())
+}
+
+async fn bootstrap_rustup(
+    rng: &mut StdRng,
+    rootfs_dir: &Path,
+    cargo_dir: &Path,
+    rustup_dir: &Path,
+    triple: &Triple,
+) -> anyhow::Result<()> {
+    let bundle_dir = Path::new("/tmp/icedragon-rustup");
+    fs::create_dir_all(bundle_dir).await?;
+    fs::create_dir_all(cargo_dir).await?;
+    fs::create_dir_all(rustup_dir).await?;
+
+    let rustup_init_file = rootfs_dir.join("rustup-init.sh");
+
+    let response = reqwest::get("https://sh.rustup.rs").await?;
+    let mut response = response.error_for_status()?;
+    let content_length = response.content_length().ok_or(anyhow!(
+        "failed to get the content-length of the rustup-install script"
+    ))?;
+
+    let pb_style = ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
+        .progress_chars("#>-");
+    let pb = ProgressBar::new(content_length);
+    pb.set_style(pb_style.clone());
+
+    let mut rustup_init_file = File::create(rustup_init_file).await?;
+    while let Some(chunk) = response.chunk().await? {
+        rustup_init_file.write_all(&chunk).await?;
+        pb.inc(chunk.len() as u64);
+    }
+    pb.finish_and_clear();
+
+    let mut perms = rustup_init_file.metadata().await?.permissions();
+    perms.set_mode(0o755);
+    rustup_init_file.set_permissions(perms).await?;
+
+    let volumes = vec![];
+    let cmd_args = vec!["/bin/sh".into(), "/rustup-init.sh".into(), "-y".into()];
+
+    let spec_file = bundle_dir.join("config.json");
+    let spec = container_spec(
+        false, rootfs_dir, cargo_dir, rustup_dir, triple, volumes, cmd_args,
+    )?;
+    spec.save(&spec_file)?;
+
+    run_container(rng, bundle_dir.into(), rootfs_dir.into()).await?;
+
     Ok(())
 }
 
@@ -678,8 +737,24 @@ async fn run_command(
 
     let rootfs_dir = state_dir.join("rootfs");
     pull_image(&mut rng, state_dir, &rootfs_dir, container_image).await?;
+
+    // Bootstrap the Rust toolchain, if not present.
+    let cargo_dir = state_dir.join("cargo");
+    let rustup_dir = state_dir.join("rustup");
+    if !cargo_dir.exists() || !rustup_dir.exists() {
+        bootstrap_rustup(&mut rng, &rootfs_dir, &cargo_dir, &rustup_dir, triple).await?;
+    }
+
     let spec_file = bundle_dir.join("config.json");
-    let spec = container_spec(interactive, &rootfs_dir, triple, volumes, cmd_args)?;
+    let spec = container_spec(
+        interactive,
+        &rootfs_dir,
+        &cargo_dir,
+        &rustup_dir,
+        triple,
+        volumes,
+        cmd_args,
+    )?;
     spec.save(&spec_file)?;
 
     run_container(&mut rng, bundle_dir.clone(), rootfs_dir).await?;

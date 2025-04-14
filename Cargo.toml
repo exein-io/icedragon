@@ -33,6 +33,7 @@ oci-client = { version = "0.14", default-features = false, features = ["rustls-t
 # icedragon.
 protobuf = "=3.2.0"
 rand = { version = "0.9", default-features = false, features = ["os_rng", "std_rng"] }
+reqwest = { version = "0.12", default-features = false }
 target-lexicon = { version = "0.12", default-features = false }
 tar = { version = "0.4", default-features = false }
 thiserror = { version = "1.0.64", default-features = false }

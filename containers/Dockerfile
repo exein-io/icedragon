@@ -82,13 +82,6 @@ COPY package.accept_keywords/* /etc/portage/package.accept_keywords/
 # * Regular expressions:
 #   * libpcre2
 #
-# Install stable and beta Rust toolchains with `default` rustup profile
-# (containing rust-docs, rustfmt, and clippy) for all supported targets.
-#
-# Install nightly Rust toolchains with `complete` rustup profile (containing
-# all components provided by rustup, available only for nightly toolchains)
-# for all supported targets.
-#
 # [0] https://wiki.gentoo.org/wiki/Crossdev
 # [1] https://github.com/llvm/llvm-project/tree/main/llvm-libgcc
 # [2] https://github.com/rust-lang/rust/issues/119504
@@ -164,12 +157,6 @@ RUN emerge-webrsync \
         sys-libs/error-standalone \
         sys-libs/fts-standalone \
         sys-libs/zlib \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustup toolchain install stable beta --profile=default \
-        --target=aarch64-unknown-linux-musl,x86_64-unknown-linux-musl \
-    && rustup toolchain install nightly --profile=complete \
-        --target=aarch64-unknown-linux-musl,x86_64-unknown-linux-musl \
-    && cargo install btfdump \
     && rm -rf \
         /var/cache/binpkgs/* \
         /var/cache/distfiles/* \
