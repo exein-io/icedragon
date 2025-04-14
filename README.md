@@ -46,12 +46,12 @@ provides sysroots and toolchains for foreign architectures out of the box. It
 does so thanks to [crossdev], which allows management and installation of
 packages inside sysroots. There is no such tooling on Alpine.
 
-## Featured libraries
+## Featured libraries and tools
 
-Icedragon comes with a set of static libraries which can be considered "build
-essentials" for the most of C/C++ software on Linux, as well as for Rust
-crates, which don't vendor C dependencies and expect them to be present in the
-system.
+Icedragon comes with a set of static libraries and tools which can be
+considered "build essentials" for the most of C/C++ software on Linux, as well
+as for Rust crates, which don't vendor C dependencies and expect them to be
+present in the system.
 
 * Compression libraries:
   * brotli
@@ -71,6 +71,11 @@ system.
   * libcurl
 * Regular expressions:
   * libpcre2
+* Tools
+  * protoc
+
+We are open to adding more libraries and tools as long as they have reasonable
+size.
 
 ## GNU extensions
 
