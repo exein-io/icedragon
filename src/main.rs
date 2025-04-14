@@ -939,6 +939,18 @@ fn mount_volumes(ctx: &ContainerContext) -> anyhow::Result<()> {
     bind_mount(&ctx.rootfs_dir, env::current_dir()?, "/src")
         .context("failed to mount the current directory")?;
     bind_mount(&ctx.rootfs_dir, "/etc/resolv.conf", "/etc/resolv.conf")?;
+    // Mount the directory with SSH keys (`$HOME/.ssh`) to be able to access
+    // private repositories.
+    let home_dir = env::var_os("HOME").ok_or(anyhow!(
+        "cannot find the home directory, `HOME` environment variable is not defined"
+    ))?;
+    let ssh_keys_dir = Path::new(&home_dir).join(".ssh");
+    if ssh_keys_dir.exists() {
+        bind_mount(&ctx.rootfs_dir, ssh_keys_dir, "/root/.ssh")?;
+    }
+    if let Ok(ssh_auth_sock) = env::var("SSH_AUTH_SOCK") {
+        bind_mount(&ctx.rootfs_dir, &ssh_auth_sock, &ssh_auth_sock)?;
+    }
     // Mount all the user-provided volumes.
     for (src, dst) in &ctx.volumes {
         bind_mount(&ctx.rootfs_dir, src, dst)
