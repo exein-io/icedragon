@@ -1,62 +1,99 @@
+#[cfg(test)]
+use std::collections::vec_deque::Iter;
 use std::{
-    collections::{vec_deque::Iter, VecDeque},
+    collections::VecDeque,
     env,
     ffi::{OsStr, OsString},
-    io::{BufRead as _, BufReader, Write as _},
-    iter,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::Stdio,
     str::FromStr as _,
-    thread,
 };
 
-use anyhow::{anyhow, Context as _};
+use anyhow::{anyhow, bail, Context as _};
 use clap::{Parser, Subcommand, ValueEnum};
-use log::{error, info};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use libcontainer::{
+    container::builder::ContainerBuilder,
+    oci_spec::runtime::{
+        get_rootless_mounts, Linux, Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec,
+        SpecBuilder,
+    },
+    syscall::syscall::SyscallType,
+    workload::default::DefaultExecutor,
+};
+use log::{debug, error, info};
+use nix::{
+    sys::wait::waitpid,
+    unistd::{Gid, Uid},
+};
+use oci_client::{
+    client::{ClientConfig as OciClientConfig, ClientProtocol as OciClientProtocol},
+    secrets::RegistryAuth as OciRegistryAuth,
+    Client as OciClient, Reference,
+};
+use rand::{distr::Alphanumeric, rngs::StdRng, Rng as _, SeedableRng as _};
 use target_lexicon::{Architecture, Environment, OperatingSystem, Triple};
+use tokio::{
+    fs::{self, read_to_string, File, OpenOptions},
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
+    process::Command,
+    task::JoinSet,
+};
+use tokio_stream::StreamExt as _;
 use which::which;
 
 /// Content of the dockerfile.
 const DOCKERFILE: &[u8] = include_bytes!("../containers/Dockerfile");
 
-/// A wrapper over [`VecDeque`] making it easy to gather platform-native
-/// strings.
-#[derive(Debug, Default)]
-struct OsVecDeque(VecDeque<OsString>);
+const LLVM_VERSION: u32 = 19;
 
-impl OsVecDeque {
+/// A wrapper over [`VecDeque`] making it easy to gather strings without manual
+/// conversions on the caller's side.
+#[derive(Debug, Default)]
+struct StringVecDeque(VecDeque<String>);
+
+impl StringVecDeque {
     fn with_capacity(capacity: usize) -> Self {
         Self(VecDeque::with_capacity(capacity))
     }
 
-    fn contains_any<S>(&self, items: &[S]) -> bool
-    where
-        S: AsRef<OsStr>,
-    {
-        self.0
-            .iter()
-            .any(|a| items.iter().any(|b| a.eq(b.as_ref())))
+    fn contains_any<S: PartialEq<String>>(&self, items: &[S]) -> bool {
+        self.0.iter().any(|a| items.iter().any(|b| b.eq(a)))
     }
 
-    fn iter(&self) -> Iter<'_, OsString> {
+    #[cfg(test)]
+    fn iter(&self) -> Iter<'_, String> {
         self.0.iter()
     }
 
-    fn push_back<S: AsRef<OsStr>>(&mut self, s: S) {
-        self.0.push_back(s.as_ref().to_owned());
+    fn push_back<S: Into<String>>(&mut self, s: S) {
+        self.0.push_back(s.into());
     }
 
-    fn push_front<S: AsRef<OsStr>>(&mut self, s: S) {
-        self.0.push_front(s.as_ref().to_owned());
+    fn push_front<S: Into<String>>(&mut self, s: S) {
+        self.0.push_front(s.into());
     }
 }
 
-impl<S> From<Vec<S>> for OsVecDeque
-where
-    S: AsRef<OsStr>,
-{
-    fn from(vec: Vec<S>) -> Self {
-        let vec_deque = vec.into_iter().map(|s| s.as_ref().to_owned()).collect();
-        Self(vec_deque)
+impl From<Vec<&str>> for StringVecDeque {
+    fn from(src: Vec<&str>) -> Self {
+        let mut dst = Self::with_capacity(src.len());
+        for s in src {
+            dst.push_back(s);
+        }
+        dst
+    }
+}
+
+impl From<Vec<String>> for StringVecDeque {
+    fn from(vec: Vec<String>) -> Self {
+        Self(VecDeque::from(vec))
+    }
+}
+
+impl From<StringVecDeque> for Vec<String> {
+    fn from(val: StringVecDeque) -> Self {
+        Vec::from(val.0)
     }
 }
 
@@ -67,9 +104,9 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Container engine (if not provided, is going to be autodetected).
-    #[arg(global = true, long)]
-    container_engine: Option<ContainerEngine>,
+    /// Directory where the internal state is stored.
+    #[arg(global = true, long, default_value = "~/.icedragon")]
+    state_dir: OsString,
 
     /// Target triple.
     #[arg(global = true, long)]
@@ -138,6 +175,10 @@ impl ContainerEngine {
 
 #[derive(Parser)]
 struct BuildContainerImageArgs {
+    /// Container engine (if not provided, is going to be autodetected).
+    #[arg(global = true, long)]
+    container_engine: Option<ContainerEngine>,
+
     /// Do not use existing cached images for the container build. Build from
     /// the start with a new set of cached layers.
     #[arg(long)]
@@ -162,7 +203,7 @@ struct BuildContainerImageArgs {
 /// # Errors
 ///
 /// Returns an error if the push was not successful.
-fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result<()> {
+async fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result<()> {
     let mut cmd = Command::new(container_engine);
     cmd.arg("push")
         .arg(tag)
@@ -173,21 +214,29 @@ fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result
     info!("Pushing image with command: {cmd:?}");
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    thread::scope(|s| {
-        s.spawn(|| {
-            for line in BufReader::new(stdout).lines() {
-                let line = line.unwrap();
-                info!("{line}");
+    tokio::spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => info!("{line}"),
+                Ok(None) => break,
+                Err(e) => error!("Failed to read stdout: {e}"),
             }
-        });
-        s.spawn(|| {
-            for line in BufReader::new(stderr).lines() {
-                let line = line.unwrap();
-                error!("{line}");
-            }
-        });
+        }
     });
-    let status = child.wait()?;
+    tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => error!("{line}"),
+                Ok(None) => break,
+                Err(e) => error!("Failed to read stderr: {e}"),
+            }
+        }
+    });
+    let status = child.wait().await?;
     if !status.success() {
         return Err(anyhow!("failed to push a container image: {status}"));
     }
@@ -203,15 +252,18 @@ fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result
 ///
 /// * The image build was unsuccessful.
 /// * If any of the tags could not be pushed.
-fn build_container_image(
-    container_engine: &ContainerEngine,
-    args: BuildContainerImageArgs,
-) -> anyhow::Result<()> {
+async fn build_container_image(args: BuildContainerImageArgs) -> anyhow::Result<()> {
     let BuildContainerImageArgs {
+        container_engine,
         no_cache,
         push,
         tags,
     } = args;
+
+    let container_engine = match container_engine {
+        Some(ref container_engine) => container_engine,
+        None => &ContainerEngine::autodetect()?,
+    };
 
     let mut cmd = Command::new(container_engine);
     cmd.current_dir("containers");
@@ -231,28 +283,36 @@ fn build_container_image(
     let mut child = cmd.spawn()?;
     {
         let mut stdin = child.stdin.take().expect("child should have piped stdin");
-        stdin.write_all(DOCKERFILE)?;
+        stdin.write_all(DOCKERFILE).await?;
     }
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    thread::scope(|s| {
-        s.spawn(|| {
-            for line in BufReader::new(stdout).lines() {
-                let line = line.unwrap();
-                info!("{line}");
+    tokio::spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => info!("{line}"),
+                Ok(None) => break,
+                Err(e) => error!("Failed to read stdout: {e}"),
             }
-        });
-        s.spawn(|| {
-            for line in BufReader::new(stderr).lines() {
-                let line = line.unwrap();
+        }
+    });
+    tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        loop {
+            match lines.next_line().await {
                 // Use `info!` even for stderr. The most of stderr messages are
                 // progress-related logs from emerge, logging them with `error!`
                 // would be confusing.
-                info!("{line}");
+                Ok(Some(line)) => info!("{line}"),
+                Ok(None) => break,
+                Err(e) => error!("Failed to read stderr: {e}"),
             }
-        });
+        }
     });
-    let status = child.wait()?;
+    let status = child.wait().await?;
     if !status.success() {
         return Err(anyhow!("failed to build container image: {status}"));
     }
@@ -261,6 +321,7 @@ fn build_container_image(
     if push {
         for tag in &tags {
             if let Err(e) = push_image(container_engine, tag)
+                .await
                 .with_context(|| format!("failed to push the tag {tag:?}"))
             {
                 errors.push(e);
@@ -279,173 +340,371 @@ fn build_container_image(
 struct RunArgs {
     /// Container image to use.
     #[arg(long, default_value = "ghcr.io/exein-io/icedragon:latest")]
-    pub container_image: OsString,
+    pub container_image: String,
 
     /// Additional volumes to mount to the container.
     #[arg(long = "volume", short)]
-    pub volumes: Vec<OsString>,
+    pub volumes: Vec<String>,
 
     /// The command to run inside the container.
     #[arg(trailing_var_arg = true)]
-    pub cmd: Vec<OsString>,
+    pub cmd: Vec<String>,
 }
 
-/// Takes a `cmd`, representing a container engine, and adds `--env` arguments,
+/// Returns a vector of environment variables to use in the container spec,
 /// consisting of:
 ///
-/// * The current environment variables, except `PATH`, which should be
-///   inherited from the Dockerfile.
-/// * Additional variables defined by us:
+/// * The current environment variables, except ones like `HOME`, `PATH` etc.,
+///   which would break the containerized environment.
+/// * Additional variables defined by us to shape the behavior of compilers and
+///   making sure they perform a correct cross build for the given `target`:
+///   * `CARGO_BUILD_TARGET`, telling cargo what target to build for.
+///   * `CC` and `CXX` pointing to the clang cross wrappers.
 ///   * `CXXFLAGS` and `LDFLAGS`, pointing to LLVM libc++ as a C++ stdlib, LLD
 ///     as a linker, compiler-rt as a runtime library and LLVM libunwind as
 ///     unwinder.
+///   * `PATH` including the directories of LLVM and Rust toolchains.
 ///   * `PKG_CONFIG_SYSROOT_DIR`, to point pkg-config to the sysroot.
-fn add_env_args(cmd: &mut Command, triple: &Triple) {
-    for (key, value) in env::vars_os() {
-        if key != "PATH" {
-            let mut env_arg = OsString::from("--env=");
-            env_arg.push(key);
-            env_arg.push("=");
-            env_arg.push(value);
-            cmd.arg(env_arg);
+///   * `RUSTUP_HOME` pointing to the directory with Rust toolchains.
+///   * `RUSTFLAGS` telling Rust to:
+///     * Use an appropriate clang wrapper as a linker.
+///     * Use the cross sysroot.
+///   * `CARGO_TARGET_{triple}_RUNNER`, pointing to a QEMU user-space emulator,
+///     if the host and target CPU targets are different.
+fn prepare_env(triple: &Triple) -> Vec<String> {
+    let mut env: Vec<String> = env::vars()
+        .filter_map(|(key, value)| {
+            if matches!(key.as_str(), "HOME" | "OLDPWD" | "PATH" | "PWD" | "USER") {
+                None
+            } else {
+                Some(format!("{key}={value}"))
+            }
+        })
+        .collect();
+    env.extend_from_slice(&[
+        format!("CARGO_BUILD_TARGET={triple}"),
+        format!("CC={triple}-clang"),
+        format!("CXX={triple}-clang++"),
+        format!("CXXFLAGS={} --stdlib=libc++", env::var("CXXFLAGS").unwrap_or_default()),
+        format!("LDFLAGS={} -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind", env::var("LDFLAGS").unwrap_or_default()),
+        format!("PATH=/root/.cargo/bin:/usr/lib/llvm/{LLVM_VERSION}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        format!("PKG_CONFIG_SYSROOT_DIR=/usr/{triple}"),
+        "RUSTUP_HOME=/root/.rustup".to_owned(),
+        format!(
+            "RUSTFLAGS={} -C linker={triple}-clang -C link-arg=--sysroot=/usr/{triple}",
+            env::var("RUSTFLAGS").unwrap_or_default()
+        ),
+    ]);
+    let Triple { architecture, .. } = triple;
+    if architecture != &target_lexicon::HOST.architecture {
+        let triple = triple.to_string().to_uppercase().replace('-', "_");
+        env.push(format!("CARGO_TARGET_{triple}_RUNNER=qemu-{architecture}"));
+    }
+    env
+}
+
+/// Returns a random string with the given `len`.
+fn rand_string(rng: &mut StdRng, len: usize) -> String {
+    rng.sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
+
+/// Pulls the given `container_image` from an OCI registry and unpacks it into
+/// the given `rootfs_dir`.
+///
+/// The `{state_dir}/digest` file is used for storing the digest of the
+/// downloaded image. The image pull is skipped if the digest stored there is
+/// already up-to-date. Otherwise, it's updated after the successfull image
+/// pull.
+async fn pull_image(
+    rng: &mut StdRng,
+    state_dir: &Path,
+    rootfs_dir: &PathBuf,
+    container_image: &str,
+) -> anyhow::Result<()> {
+    let config = OciClientConfig {
+        protocol: OciClientProtocol::Https,
+        ..Default::default()
+    };
+    let client = OciClient::new(config);
+    let reference: Reference = container_image.parse()?;
+
+    let layers_dir = rand_string(rng, 6);
+    let layers_dir = Path::new("/tmp").join(layers_dir);
+
+    fs::create_dir_all(&layers_dir).await?;
+
+    let (manifest, digest) = client
+        .pull_image_manifest(&reference, &OciRegistryAuth::Anonymous)
+        .await?;
+
+    // Check if we have an up-to-date image fetched locally.
+    let digest_file = state_dir.join("digest");
+    if digest_file.exists() {
+        let local_digest = read_to_string(&digest_file).await?;
+        if local_digest == digest {
+            debug!(
+                "Image already up-to-date (local digest: {local_digest}, latest digest: {digest})"
+            );
+            return Ok(());
         }
     }
-    cmd.arg("--env=CXXFLAGS=--stdlib=libc++");
-    cmd.arg("--env=LDFLAGS=-fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind");
-    cmd.arg(format!("--env=PKG_CONFIG_SYSROOT_DIR=/usr/{triple}"));
-    cmd.arg("--env=RUSTUP_HOME=/root/.rustup");
 
-    let mut rustflags_arg = OsString::from("--env=RUSTFLAGS=");
-    rustflags_arg.push(env::var_os("RUSTFLAGS").unwrap_or_default());
-    rustflags_arg.push(format!(
-        "-C linker={triple}-clang -C link-arg=--sysroot=/usr/{triple}"
-    ));
-    cmd.arg(rustflags_arg);
+    info!("📥 Pulling image");
+    let mut layer_files = Vec::with_capacity(manifest.layers.len());
+    let mut download_tasks = JoinSet::new();
+
+    let mpb = MultiProgress::new();
+
+    for layer in manifest.layers {
+        let client = client.clone();
+        let reference = reference.clone();
+        let mpb = mpb.clone();
+        let pb_style = ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
+        .progress_chars("#>-");
+
+        let layer_file = layers_dir.join(&layer.digest);
+        layer_files.push(layer_file.clone());
+
+        download_tasks.spawn(async move {
+            let mut layer_file = File::create(layer_file).await.unwrap();
+
+            let mut stream = client.pull_blob_stream(&reference, &layer).await.unwrap();
+
+            // Why is `oci-spec` storing layer size as `i64`? No idea. ¯\_(ツ)_/¯
+            #[allow(clippy::cast_sign_loss)]
+            let content_length = stream.content_length.unwrap_or(layer.size as u64);
+
+            let pb = mpb.add(ProgressBar::new(content_length));
+            pb.set_style(pb_style.clone());
+            while let Some(res) = stream.next().await {
+                let chunk = res.unwrap();
+                layer_file.write_all(&chunk).await.unwrap();
+                pb.inc(chunk.len() as u64);
+            }
+            pb.finish_and_clear();
+        });
+    }
+    download_tasks.join_all().await;
+
+    // Remove the outdated image.
+    if rootfs_dir.exists() {
+        fs::remove_dir_all(&rootfs_dir).await?;
+    }
+    fs::create_dir_all(&rootfs_dir).await?;
+
+    info!("📦 Unpacking image");
+    // NOTE(vadorovsky): There are multiple `tokio-tar` crates... and none of
+    // them is working properly:
+    //
+    // * `tokio-tar` and `krata-tokio-tar` are not able to unpack Python
+    //   artifacts, failing with errors like `failed to unpack [..]/__pycache__/t`.
+    //   Not sure what the issue is there, but might be related to symlinks.
+    // * `astral-tokio-tar` doesn't preserve the permissions and execute bits of
+    //   unpacked files.
+    //
+    // The upstream, non-async `tar` crate works just fine. Using it here is
+    // not ideal, we should definitely fix that at some poit.
+    //
+    // Overall, the most frustrating thing is that all the "async tar" crates
+    // are full forks, which end up broken and not up-to-date. There is a
+    // proposal of making a sans-io tar crate[0], which sounds like a good
+    // idea.
+    //
+    // The other way could be writing a collection of extension traits for
+    // types from the `tar` crate (like `Archive` or `Entry`) which work with
+    // async reader types, trying to re-use as much of the upstream logic as
+    // possible.
+    //
+    // [0] https://github.com/alexcrichton/tar-rs/issues/379
+    let mut unpack_tasks = JoinSet::new();
+    for layer_file in layer_files {
+        unpack_tasks.spawn_blocking({
+            let rootfs_dir = rootfs_dir.clone();
+            move || {
+                let layer_file = std::fs::File::open(layer_file).unwrap();
+                let reader = std::io::BufReader::new(layer_file);
+                let stream = flate2::bufread::GzDecoder::new(reader);
+                let mut archive = tar::Archive::new(stream);
+                archive.unpack(&rootfs_dir).unwrap();
+            }
+        });
+    }
+    unpack_tasks.join_all().await;
+
+    fs::remove_dir_all(&layers_dir).await?;
+
+    let mut digest_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&digest_file)
+        .await?;
+    digest_file.write_all(digest.as_bytes()).await?;
+
+    Ok(())
+}
+
+/// Returns an OCI-compliant mount declaration of a bind mount from `src` to `dst`.
+fn bind_mount(src: impl Into<PathBuf>, dst: impl Into<PathBuf>) -> anyhow::Result<Mount> {
+    let mount = MountBuilder::default()
+        .destination(dst)
+        .typ("bind")
+        .source(src)
+        .options(["bind".into()])
+        .build()?;
+    Ok(mount)
+}
+
+/// Returns mounts for the container - predefined defaults and the bind mounts
+/// based on user-provided `volumes`.
+fn mounts(volumes: Vec<String>) -> anyhow::Result<Vec<Mount>> {
+    let mut mounts = get_rootless_mounts();
+    // Mount the current directory.
+    let src_mount = bind_mount(env::current_dir()?, "/src")?;
+    mounts.push(src_mount);
+    // Mount `/etc/resolv.conf`, otherwise the container might not be able to
+    // resolve domains.
+    let resolv_mount = bind_mount("/etc/resolv.conf", "/etc/resolv.conf")?;
+    mounts.push(resolv_mount);
+    // Mount all the user-provided volumes.
+    for volume in volumes {
+        let parts: Vec<&str> = volume.split(':').collect();
+        if parts.len() != 2 {
+            return Err(anyhow!("invalid volume format: {volume}"));
+        }
+        let (src, dst) = (parts[0], parts[2]);
+        mounts.push(bind_mount(src, dst)?);
+    }
+    Ok(mounts)
+}
+
+/// Returns a spec of a container.
+fn container_spec(
+    interactive: bool,
+    rootfs_dir: &Path,
+    triple: &Triple,
+    volumes: Vec<String>,
+    cmd_args: impl Into<Vec<String>>,
+) -> anyhow::Result<Spec> {
+    let uid = Uid::current().as_raw();
+    let gid = Gid::current().as_raw();
+    let linux_spec = Linux::rootless(uid, gid);
+    let root = RootBuilder::default()
+        .readonly(false)
+        .path(rootfs_dir)
+        .build()?;
+    let env = prepare_env(triple);
+    let process = ProcessBuilder::default()
+        .terminal(interactive)
+        .args(cmd_args)
+        .env(env)
+        .cwd("/src")
+        .build()?;
+    let spec = SpecBuilder::default()
+        .root(root)
+        .mounts(mounts(volumes)?)
+        .process(process)
+        .linux(linux_spec)
+        .build()?;
+    Ok(spec)
+}
+
+/// Runs a container, based on a `bundle_dir` with an OCI-compliant spec and
+/// `rootfs`.
+async fn run_container(
+    rng: &mut StdRng,
+    bundle_dir: PathBuf,
+    rootfs_dir: PathBuf,
+) -> anyhow::Result<()> {
+    let container_id = rand_string(rng, 5);
+    let container_id = format!("icdrgn-{container_id}");
+    let container_task = tokio::task::spawn_blocking({
+        move || {
+            let mut container = ContainerBuilder::new(container_id, SyscallType::Linux)
+                .with_executor(DefaultExecutor {})
+                .with_root_path(&rootfs_dir)
+                .unwrap()
+                .validate_id()
+                .unwrap()
+                .as_init(&bundle_dir)
+                .with_systemd(false)
+                .build()
+                .unwrap();
+
+            container.start().unwrap();
+            waitpid(container.pid().expect("container should have a pid"), None).unwrap();
+            container.delete(true).unwrap();
+        }
+    });
+    container_task.await?;
+    Ok(())
 }
 
 /// Runs a command inside a container.
 ///
-/// The main work done by this function is constructing a container engine
-/// call from the provided arguments. It does so by merging the following
-/// parts into a list or arguments:
+/// It does so in the following steps:
 ///
-/// * `container_engine`, wrapped by a `runner`, if provided.
-/// * Container engine options:
-///   * `--rm`, which removes the container after execution.
-///   * `-it`, if the `interactive` option is enabled.
-///   * Bind mount of the current directory as `/src` inside container
-///     (equivalent of `-v $(pwd):/src`).
-///   * Container image determined based on `cli_args`
-///   * Additional `container_engine_args` provided by a caller.
-/// * Provided `cmd_args` as a command to run inside a container.
+/// * Creating an unique, temporary bundle directory.
+/// * Generating a container spec.
+/// * Saving the container spec in the bundle directory.
+/// * Running the container based on the bundle directory.
 ///
-/// Target `triple` is used to determine additional environment variables,
-fn run_container(
-    container_engine: &ContainerEngine,
+/// Unfortunately, libcontainer's public API allows only runing containers
+/// based on bundle directories. Passing a spec as a struct is not
+/// possible.
+async fn run_command(
     interactive: bool,
+    state_dir: &Path,
     triple: &Triple,
-    container_image: &OsStr,
-    container_engine_args: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd_args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    container_image: &str,
+    volumes: Vec<String>,
+    cmd_args: impl Into<Vec<String>>,
 ) -> anyhow::Result<()> {
-    let mut bind_mount = env::current_dir()?.into_os_string();
-    bind_mount.push(":/src");
+    let mut rng = StdRng::from_os_rng();
 
-    let mut container = Command::new(container_engine);
-    container.arg("run");
-    add_env_args(&mut container, triple);
-    if interactive {
-        container.arg("-it");
+    let bundle_dir = rand_string(&mut rng, 6);
+    let bundle_dir = Path::new("/tmp").join(bundle_dir);
+    if !bundle_dir.exists() {
+        fs::create_dir_all(&bundle_dir).await?;
     }
-    container.args(["--rm", "-v"]).arg(&bind_mount);
-    for volume in volumes {
-        container.arg("-v");
-        container.arg(volume);
-    }
-    container
-        .args(["-w", "/src"])
-        .args(container_engine_args)
-        .arg(container_image)
-        .args(cmd_args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    info!("Running container with command: {container:?}");
 
-    let mut child = container.spawn()?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "failed to run command {:?}, exit code: {:?}",
-            container.get_args(),
-            status.code()
-        ))
-    }
+    let rootfs_dir = state_dir.join("rootfs");
+    pull_image(&mut rng, state_dir, &rootfs_dir, container_image).await?;
+    let spec_file = bundle_dir.join("config.json");
+    let spec = container_spec(interactive, &rootfs_dir, triple, volumes, cmd_args)?;
+    spec.save(&spec_file)?;
+
+    run_container(&mut rng, bundle_dir.clone(), rootfs_dir).await?;
+
+    fs::remove_dir_all(&bundle_dir).await?;
+
+    Ok(())
 }
 
 /// Runs cargo inside a container.
-fn cargo(
-    container_engine: &ContainerEngine,
+async fn cargo(
+    state_dir: &Path,
     triple: &Triple,
-    container_image: &OsStr,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd: &mut OsVecDeque,
+    container_image: &str,
+    volumes: Vec<String>,
+    mut cmd: StringVecDeque,
 ) -> anyhow::Result<()> {
-    // Pass additional environment variables:
-    //
-    // * `CARGO_BUILD_TARGET`, pointing to our target.
-    // * `CARGO_TARGET_*_RUNNER`, defined only for foreigh architectures,
-    //    referencing the user-space emulator (QEMU) as a runner.
-    // * `CC` and `CXX`, used by `cc-rs` and many build systems, which might
-    //   potentially get called by build.rs of various crates, to determine a
-    //   C/C++ compiler to use. Set them to the clang wrappers.
-    // * `RUSTFLAGS`, which we extend, pointing Rust to an appropriate clang
-    //   wrapper as a linker and to a cross sysroot.
-    // * `RUSTUP_HOME`, which points to the directory with toolchains inside the
-    //   container filesystem.
-    let mut rustflags_arg = OsString::from("--env=RUSTFLAGS=");
-    rustflags_arg.push(env::var_os("RUSTFLAGS").unwrap_or_default());
-    rustflags_arg.push(format!(
-        "-C linker={triple}-clang -C link-arg=--sysroot=/usr/{triple}"
-    ));
-    let mut container_engine_args = OsVecDeque::with_capacity(4);
-    container_engine_args.push_back(format!("--env=CARGO_BUILD_TARGET={triple}"));
-    // If the target CPU architecture is different, use the user-space emulator
-    // (QEMU) as a runner.
-    let Triple { architecture, .. } = triple;
-    if architecture != &target_lexicon::HOST.architecture {
-        let triple = triple.to_string().to_uppercase().replace('-', "_");
-        container_engine_args.push_back(format!(
-            "--env=CARGO_TARGET_{triple}_RUNNER=qemu-{architecture}"
-        ));
-    }
-    container_engine_args.push_back(format!("--env=CC={triple}-clang"));
-    container_engine_args.push_back(format!("--env=CXX={triple}-clang++"));
-    container_engine_args.push_back(rustflags_arg);
-
     // The command is `cargo` followed by arguments provided by the caller.
     cmd.push_front("cargo");
 
-    run_container(
-        container_engine,
-        false,
-        triple,
-        container_image,
-        container_engine_args.iter(),
-        volumes,
-        cmd.iter(),
-    )
+    run_command(false, state_dir, triple, container_image, volumes, cmd).await
 }
 
 /// Runs clang inside a container.
-fn clang(
-    container_engine: &ContainerEngine,
+async fn clang(
+    state_dir: &Path,
     triple: &Triple,
-    container_image: &OsStr,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd: &mut OsVecDeque,
+    container_image: &str,
+    volumes: Vec<String>,
+    mut cmd: StringVecDeque,
 ) -> anyhow::Result<()> {
     // The command is a clang wrapper (e.g. `aarch64-unknown-linux-musl-clang`)
     // followed by arguments provided by the caller.
@@ -466,26 +725,18 @@ fn clang(
     };
     cmd.push_front(clang_cmd);
 
-    run_container(
-        container_engine,
-        false,
-        triple,
-        container_image,
-        iter::empty::<OsString>(),
-        volumes,
-        cmd.iter(),
-    )
+    run_command(false, state_dir, triple, container_image, volumes, cmd).await
 }
 
 /// Runs `CMake` inside a container. If the command involves configuring a
 /// project, adds parameters necessary for cross-compilation for the given
 /// target.
-fn cmake(
-    container_engine: &ContainerEngine,
+async fn cmake(
+    state_dir: &Path,
     triple: &Triple,
-    container_image: &OsStr,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd: &mut OsVecDeque,
+    container_image: &str,
+    volumes: Vec<String>,
+    mut cmd: StringVecDeque,
 ) -> anyhow::Result<()> {
     // Determine whether we are configuring a CMake project.
     //
@@ -496,7 +747,7 @@ fn cmake(
     let configure = !cmd.contains_any(&["--build", "--help", "--install", "--open"]);
 
     // The command is `cmake` followed by arguments provided by the caller...
-    cmd.push_front("cmake");
+    cmd.push_front("cmake".to_owned());
 
     // ...and then by options necessary for cross-compilation. Do it only when
     // configuring the project.
@@ -541,34 +792,18 @@ fn cmake(
         cmd.push_back(format!("-DCMAKE_SYSROOT=/usr/{triple}"));
     }
 
-    run_container(
-        container_engine,
-        false,
-        triple,
-        container_image,
-        iter::empty::<OsString>(),
-        volumes,
-        cmd.iter(),
-    )
+    run_command(false, state_dir, triple, container_image, volumes, cmd).await
 }
 
 /// Run a command inside a container.
-fn run(
-    container_engine: &ContainerEngine,
+async fn run(
+    state_dir: &Path,
     triple: &Triple,
-    container_image: &OsStr,
-    volumes: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    cmd: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    container_image: &str,
+    volumes: Vec<String>,
+    cmd: Vec<String>,
 ) -> anyhow::Result<()> {
-    run_container(
-        container_engine,
-        true,
-        triple,
-        container_image,
-        iter::empty::<OsString>(),
-        volumes,
-        cmd,
-    )
+    run_command(true, state_dir, triple, container_image, volumes, cmd).await
 }
 
 /// Parses and validates the given `target` triple.
@@ -605,39 +840,48 @@ fn parse_target(target: Option<&str>) -> anyhow::Result<Triple> {
     Ok(triple)
 }
 
-fn main() -> anyhow::Result<()> {
+/// Expands a tilde with a home directory in the given path.
+fn expand_tilde<P: AsRef<Path>>(p: P) -> anyhow::Result<PathBuf> {
+    let p = p.as_ref();
+    if p.starts_with("~") {
+        let mut home = match env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => bail!("the current user has no HOME directory"),
+        };
+        if !p.ends_with("~") {
+            home.extend(p.components().skip(1));
+        }
+        Ok(home)
+    } else {
+        Ok(p.to_path_buf())
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Cli {
         command,
-        container_engine,
+        state_dir,
         target,
     } = cli;
 
-    let container_engine = match container_engine {
-        Some(ref container_engine) => container_engine,
-        None => &ContainerEngine::autodetect()?,
-    };
-
+    let state_dir = expand_tilde(state_dir)?;
+    fs::create_dir_all(&state_dir).await?;
     let triple = parse_target(target.as_deref())?;
 
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
     match command {
-        Commands::BuildContainerImage(args) => build_container_image(container_engine, args),
+        Commands::BuildContainerImage(args) => build_container_image(args).await,
         Commands::Cargo(args) => {
             let RunArgs {
                 container_image,
                 volumes,
                 cmd,
             } = args;
-            cargo(
-                container_engine,
-                &triple,
-                &container_image,
-                &volumes,
-                &mut cmd.into(),
-            )
+            cargo(&state_dir, &triple, &container_image, volumes, cmd.into()).await
         }
         Commands::Clang(args) => {
             let RunArgs {
@@ -645,13 +889,7 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
-            clang(
-                container_engine,
-                &triple,
-                &container_image,
-                &volumes,
-                &mut cmd.into(),
-            )
+            clang(&state_dir, &triple, &container_image, volumes, cmd.into()).await
         }
         Commands::Cmake(args) => {
             let RunArgs {
@@ -659,13 +897,7 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
-            cmake(
-                container_engine,
-                &triple,
-                &container_image,
-                &volumes,
-                &mut cmd.into(),
-            )
+            cmake(&state_dir, &triple, &container_image, volumes, cmd.into()).await
         }
         Commands::Run(args) => {
             let RunArgs {
@@ -673,7 +905,7 @@ fn main() -> anyhow::Result<()> {
                 volumes,
                 cmd,
             } = args;
-            run(container_engine, &triple, &container_image, &volumes, &cmd)
+            run(&state_dir, &triple, &container_image, volumes, cmd).await
         }
     }
 }
@@ -684,21 +916,17 @@ mod test {
 
     #[test]
     fn test_vec_deque_conv() {
-        let vec = vec!["foo", "bar", "baz"];
-        let vec_deq: OsVecDeque = vec.into();
+        let vec = vec!["foo".to_owned(), "bar".to_owned(), "baz".to_owned()];
+        let vec_deq: StringVecDeque = vec.into();
 
-        for (a, b) in vec_deq.iter().zip(&[
-            OsString::from("foo"),
-            OsString::from("bar"),
-            OsString::from("baz"),
-        ]) {
+        for (a, b) in vec_deq.iter().zip(&["foo", "bar", "baz"]) {
             assert_eq!(a, b);
         }
     }
 
     #[test]
     fn test_vec_deque_push() {
-        let mut vec_deq = OsVecDeque::default();
+        let mut vec_deq = StringVecDeque::default();
 
         vec_deq.push_back("ayy");
         vec_deq.push_back("lmao");
@@ -706,12 +934,7 @@ mod test {
         vec_deq.push_front("bar");
         vec_deq.push_front("foo");
 
-        for (a, b) in vec_deq.iter().zip(&[
-            OsString::from("foo"),
-            OsString::from("bar"),
-            OsString::from("ayy"),
-            OsString::from("lmao"),
-        ]) {
+        for (a, b) in vec_deq.iter().zip(&["foo", "bar", "ayy", "lmao"]) {
             assert_eq!(a, b);
         }
     }
@@ -720,16 +943,16 @@ mod test {
     fn test_vec_deque_contains_any() {
         let cmake_action_args = &["--build", "--help", "--install", "--open"];
 
-        let args: OsVecDeque = vec!["cmake", "--build"].into();
+        let args: StringVecDeque = vec!["cmake", "--build"].into();
         assert!(args.contains_any(cmake_action_args));
-        let args: OsVecDeque = vec!["cmake", "--help"].into();
+        let args: StringVecDeque = vec!["cmake", "--help"].into();
         assert!(args.contains_any(cmake_action_args));
-        let args: OsVecDeque = vec!["cmake", "--install"].into();
+        let args: StringVecDeque = vec!["cmake", "--install"].into();
         assert!(args.contains_any(cmake_action_args));
-        let args: OsVecDeque = vec!["cmake", "--open", "myproject"].into();
+        let args: StringVecDeque = vec!["cmake", "--open", "myproject"].into();
         assert!(args.contains_any(cmake_action_args));
 
-        let args: OsVecDeque = vec![
+        let args: StringVecDeque = vec![
             "cmake",
             "-S",
             "llvm",
