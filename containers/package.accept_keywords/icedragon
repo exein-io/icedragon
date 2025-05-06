@@ -35,7 +35,7 @@
 
 # QEMU 9.1.2 (the current stable) doesn't build with musl. All newer versions
 # build without problems. Unmask the latest testing package.
-=app-emulation/qemu-9.2.2
+=app-emulation/qemu-9.2.3-r2
 
 # llvm-runtimes/libgcc is undergoing testing for amd64 and provides no keywords
 # for the rest of architectures. Unmask it with `**`. Our CI proves that it works
