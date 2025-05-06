@@ -5,6 +5,7 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     io::{BufRead as _, BufReader, Write as _},
+    os::unix::fs::PermissionsExt as _,
     path::{Component, Path, PathBuf},
     process::{self, Command, Stdio},
     str::FromStr as _,
@@ -213,10 +214,16 @@ struct RunArgs {
 struct ContainerContext {
     /// Indicates whether stdin should be piped to the container.
     interactive: bool,
+    /// Indicates whether rustup has to be bootstraped.
+    bootstrap_rust: bool,
     /// Path to the main directory with icedragon's state.
     state_dir: PathBuf,
     /// Path to the container root filesystem.
     rootfs_dir: PathBuf,
+    /// Path to the host directory to mount as `.cargo` inside the container.
+    cargo_dir: PathBuf,
+    /// Path to the host directory to mount as `.rustup` inside the container.
+    rustup_dir: PathBuf,
     /// Target triple.
     triple: Triple,
     /// Indicates whether `CC` and `CXX` variables should be set.
@@ -253,10 +260,18 @@ impl ContainerContext {
         cmd: OsVecDeque,
     ) -> Self {
         let rootfs_dir = state_dir.join("rootfs");
+
+        let cargo_dir = state_dir.join("cargo");
+        let rustup_dir = state_dir.join("rustup");
+        let bootstrap_rust = !cargo_dir.exists() || !rustup_dir.exists();
+
         Self {
             interactive,
+            bootstrap_rust,
             state_dir: state_dir.to_path_buf(),
             rootfs_dir,
+            cargo_dir,
+            rustup_dir,
             triple,
             override_cc_with_cross,
             volumes,
@@ -494,6 +509,58 @@ fn rand_string(rng: &mut StdRng, len: usize) -> String {
         .collect()
 }
 
+/// Downloads a file from the given `url` into `target_file` and shows progress
+/// using `mpb`.
+async fn download_file(
+    mpb: &MultiProgress,
+    url: &str,
+    target_file: &Path,
+) -> anyhow::Result<tokio::fs::File> {
+    let response = reqwest::get(url).await?;
+    let mut response = response.error_for_status()?;
+    let content_length = response
+        .content_length()
+        .ok_or(anyhow!("failed to get the content-length of {url}"))?;
+
+    let pb = mpb.add(ProgressBar::new(content_length));
+    let pb_style =
+        ProgressStyle::with_template(PROGRESS_BAR_TEMPLATE)?.progress_chars(PROGRESS_BAR_CHARS);
+    pb.set_style(pb_style.clone());
+
+    let mut target_file = tokio::fs::File::create(target_file).await?;
+    while let Some(chunk) = response.chunk().await? {
+        target_file.write_all(&chunk).await?;
+        pb.inc(chunk.len() as u64);
+    }
+    pb.finish_and_clear();
+
+    Ok(target_file)
+}
+
+/// Downloads the rustup installation script.
+async fn download_rustup(mpb: &MultiProgress, download_dir: &Path) -> anyhow::Result<()> {
+    let rustup_init_file = download_dir.join("rustup-init.sh");
+    let rustup_init_file = download_file(mpb, "https://sh.rustup.rs", &rustup_init_file).await?;
+
+    let mut perms = rustup_init_file.metadata().await?.permissions();
+    perms.set_mode(0o755);
+    rustup_init_file.set_permissions(perms).await?;
+
+    Ok(())
+}
+
+/// Downloads `cargo-binstall`.
+async fn download_cargo_binstall(mpb: &MultiProgress, download_dir: &Path) -> anyhow::Result<()> {
+    let cargo_binstall_file = download_dir.join("cargo-binstall.tgz");
+    download_file(
+        mpb,
+        "https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-unknown-linux-musl.full.tgz",
+        &cargo_binstall_file
+    ).await?;
+
+    Ok(())
+}
+
 async fn download_layer(
     client: OciClient,
     mpb: MultiProgress,
@@ -528,7 +595,7 @@ async fn download_layer(
     Ok(())
 }
 
-/// Pulls the given `container_image` from the OCI registry.
+/// Pulls the `container_image` from an OCI registry.
 async fn pull_image(
     ctx: &ContainerContext,
     download_dir: &Path,
@@ -569,6 +636,23 @@ async fn pull_image(
     let mut download_tasks = JoinSet::new();
 
     let mpb = MultiProgress::new();
+
+    if ctx.bootstrap_rust {
+        download_tasks.spawn({
+            let download_dir = download_dir.to_owned();
+            let mpb = mpb.clone();
+            async move {
+                download_rustup(&mpb, &download_dir).await.unwrap();
+            }
+        });
+        download_tasks.spawn({
+            let download_dir = download_dir.to_owned();
+            let mpb = mpb.clone();
+            async move {
+                download_cargo_binstall(&mpb, &download_dir).await.unwrap();
+            }
+        });
+    }
 
     for layer in manifest.layers {
         let client = client.clone();
@@ -619,6 +703,8 @@ where
     Ok(())
 }
 
+/// Unpacks all downloaded artifacts (container layers, rustup script,
+/// cargo-binstall).
 fn unpack_image(
     ctx: &ContainerContext,
     download_dir: &PathBuf,
@@ -658,6 +744,21 @@ fn unpack_image(
                 tx.send(res).unwrap_or_else(|e| {
                     panic!("failed to send the result of the unpacking thread: {e:?}")
                 });
+            });
+        }
+
+        if ctx.bootstrap_rust {
+            s.spawn(|| {
+                fs::copy(
+                    download_dir.join("rustup-init.sh"),
+                    ctx.rootfs_dir.join("rustup-init.sh"),
+                )
+                .unwrap();
+            });
+            s.spawn(|| {
+                let cargo_binstall_tarball = download_dir.join("cargo-binstall.tgz");
+                let cargo_bin_dir = ctx.cargo_dir.join("bin");
+                unpack_tarball(cargo_binstall_tarball, cargo_bin_dir).unwrap();
             });
         }
     });
@@ -711,6 +812,12 @@ fn prepare_container(ctx: &ContainerContext, container_image: &str) -> anyhow::R
         unpack_image(ctx, &download_dir, layer_files)?;
         write_digest(&digest_file, &digest)?;
     }
+
+    if ctx.bootstrap_rust {
+        fs::create_dir_all(&ctx.cargo_dir)?;
+        fs::create_dir_all(&ctx.rustup_dir)?;
+    }
+
     Ok(())
 }
 
@@ -888,6 +995,9 @@ fn mount_volumes(ctx: &ContainerContext) -> anyhow::Result<()> {
     if let Ok(ssh_auth_sock) = env::var("SSH_AUTH_SOCK") {
         bind_mount(&ctx.rootfs_dir, &ssh_auth_sock, &ssh_auth_sock)?;
     }
+    // Mount Rust toolchain.
+    bind_mount(&ctx.rootfs_dir, &ctx.cargo_dir, "/root/.cargo")?;
+    bind_mount(&ctx.rootfs_dir, &ctx.rustup_dir, "/root/.rustup")?;
     // Mount all the user-provided volumes.
     for volume in &ctx.volumes {
         let parts: Vec<&str> = volume.split(':').collect();
@@ -901,12 +1011,84 @@ fn mount_volumes(ctx: &ContainerContext) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_bootstrap_command<'a, P, I, S, E, K, V>(program: P, args: I, envs: E) -> anyhow::Result<()>
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = &'a (K, V)>,
+    K: AsRef<OsStr> + 'a,
+    V: AsRef<OsStr> + 'a,
+{
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env_clear();
+    // Calling `Command::envs` requires passing an iterator which yields an
+    // owned tuple `(K, V)`, even though `K` and `V` can be references (they
+    // just have to implement `AsRef<OsStr>`). But the tuple itself has to be
+    // owned.
+    //
+    // Passing a slice (`&[(K, V)]`) or referefence to a vector
+    // (`&Vec<(K, V)>`) doesn't work, because they yield `&(K, V)`.
+    //
+    // That constraint is quite inconvenient for us, because it would require
+    // every caller of `run_bootstrap_command` to pass an owned container type.
+    //
+    // In order to allow callers to pass slices, we accept iterators yielding
+    // `&'a (K, V)` and call `Command::env` in a loop.
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    if !cmd.spawn()?.wait()?.success() {
+        return Err(anyhow!("failed to execute the command {cmd:?}"));
+    }
+    Ok(())
+}
+
 fn container_child(ctx: &ContainerContext) -> anyhow::Result<Option<i32>> {
     mount_volumes(ctx)?;
     chroot(&ctx.rootfs_dir).context("`chroot` syscall failed")?;
     chdir("/src").context("failed to change directory to `/src`")?;
 
     let envs = prepare_env(&ctx.triple, ctx.override_cc_with_cross);
+
+    if ctx.bootstrap_rust {
+        run_bootstrap_command("/bin/sh", ["/rustup-init.sh", "-y"], &envs)
+            .context("failed to bootstrap rustup")?;
+        // Install stable and beta Rust toolchains with `default` rustup
+        // profile (containing rust-docs, rustfmt, and clippy) for all
+        // supported targets.
+        run_bootstrap_command(
+            "rustup",
+            [
+                "toolchain",
+                "install",
+                "stable",
+                "beta",
+                "--profile=default",
+                "--target=aarch64-unknown-linux-musl,x86_64-unknown-linux-musl",
+            ],
+            &envs,
+        )
+        .context("failed to install stable and beta Rust toolchains")?;
+        // Install nightly Rust toolchains with `complete` rustup profile
+        // (containing all components provided by rustup, available only for
+        // nightly toolchains) for all supported targets.
+        run_bootstrap_command(
+            "rustup",
+            [
+                "toolchain",
+                "install",
+                "nightly",
+                "--profile=complete",
+                "--target=aarch64-unknown-linux-musl,x86_64-unknown-linux-musl",
+            ],
+            &envs,
+        )
+        .context("failed to install nightly Rust toolchain")?;
+    }
 
     let mut cmd = ctx.cmd.command()?;
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
