@@ -1,7 +1,7 @@
 use std::{
     env, fmt,
-    fs::{self, File},
-    io::{BufReader, Read},
+    fs::File,
+    io::{BufReader, Read as _},
     path::Path,
     process::{Command, Output},
     sync::LazyLock,
@@ -31,24 +31,6 @@ static TEMPDIR: LazyLock<TempDir> = LazyLock::new(|| {
     temp_dir
 });
 
-fn extract_tarball<P, R>(mut archive: Archive<R>, dest_dir: P)
-where
-    P: AsRef<Path>,
-    R: Read,
-{
-    for entry_result in archive.entries().unwrap() {
-        let mut entry = entry_result.unwrap();
-
-        let entry_path = entry.path().unwrap();
-        let entry_path = dest_dir.as_ref().join(entry_path);
-        if let Some(parent) = entry_path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-
-        entry.unpack(entry_path).unwrap();
-    }
-}
-
 fn download_and_extract_tarball<P>(url: &str, dest_dir: P)
 where
     P: AsRef<Path>,
@@ -63,12 +45,12 @@ where
 
     if ext.eq_ignore_ascii_case("gz") {
         let stream = GzDecoder::new(reader);
-        let archive = Archive::new(stream);
-        extract_tarball(archive, dest_dir);
+        let mut archive = Archive::new(stream);
+        archive.unpack(dest_dir).unwrap();
     } else if ext.eq_ignore_ascii_case("xz") {
         let stream = XzDecoder::new(reader);
-        let archive = Archive::new(stream);
-        extract_tarball(archive, dest_dir);
+        let mut archive = Archive::new(stream);
+        archive.unpack(dest_dir).unwrap();
     } else {
         panic!("unsupported compression format in the URL {url}");
     }
