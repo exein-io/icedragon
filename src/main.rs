@@ -1,10 +1,12 @@
 use std::{
+    borrow::Cow,
     collections::{vec_deque::Iter, VecDeque},
     env,
     ffi::{OsStr, OsString},
+    fmt::Write as _,
     fs,
     io::{BufRead as _, BufReader, Write as _},
-    os::unix::process::ExitStatusExt as _,
+    os::unix::{ffi::OsStrExt as _, process::ExitStatusExt as _},
     path::{Component, Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     str::FromStr,
@@ -462,64 +464,96 @@ fn build_container_image(args: BuildContainerImageArgs) -> anyhow::Result<()> {
 /// more complex build systems such as `CMake` or Meson, which differentiate
 /// between native and cross builds, it's better to let them set the compiler
 /// target.
-fn prepare_env(triple: &Triple, override_cc_with_cross: bool) -> Vec<(String, String)> {
+fn prepare_env(
+    triple: &Triple,
+    override_cc_with_cross: bool,
+) -> impl Iterator<Item = (Cow<'static, OsStr>, Cow<'static, OsStr>)> {
     /// LLVM version installed in the image.
     const LLVM_VERSION: u32 = 19;
 
     // Pass the current environment variables, except the ones like `HOME`,
     // `PATH` etc., which would break the containerized environment. We also
     // filter out variables prefixed by `CARGO` and `RUSTUP` to make sure that
-    // the Rust toolchain inside the container is isolated, expecially when
+    // the Rust toolchain inside the container is isolated, especially when
     // icedragon is launched with `cargo run`. Variables prefixed by `SSL` are
     // filtered to make sure that ca-certificates from the container are used.
-    let mut env: Vec<(String, String)> = env::vars()
-        .filter_map(|(key, value)| {
-            if matches!(key.as_str(), "HOME" | "OLDPWD" | "PATH" | "PWD" | "USER")
-                || key.as_str().starts_with("CARGO")
-                || key.as_str().starts_with("RUSTUP")
-                || key.as_str().starts_with("SSL")
-            {
-                None
-            } else {
-                Some((key, value))
-            }
-        })
-        .collect();
-    env.extend_from_slice(&[
+    let env = env::vars_os().filter_map(|(key, value)| {
+        if key == "HOME"
+            || key == "OLDPWD"
+            || key == "PATH"
+            || key == "PWD"
+            || key == "USER"
+            || key.as_bytes().starts_with("CARGO".as_bytes())
+            || key.as_bytes().starts_with("RUSTUP".as_bytes())
+            || key.as_bytes().starts_with("SSL".as_bytes())
+        {
+            None
+        } else {
+            Some((key.into(), value.into()))
+        }
+    });
+
+    // Use all LLVM components, including the linker, standard C++ library and runtime libraries.
+    // Without being explicit about that, clang might still try to use the GNU equivalents.
+    let mut cxxflags = env::var_os("CXXFLAGS").unwrap_or_default();
+    cxxflags.push(" --stdlib=libc++");
+    let mut ldflags = env::var_os("LDFLAGS").unwrap_or_default();
+    ldflags.push(" -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind");
+    let mut rustflags = env::var_os("RUSTFLAGS").unwrap_or_default();
+    rustflags.push(" ");
+    write!(
+        &mut rustflags,
+        "-C linker={triple}-clang -C link-arg=--sysroot=/usr/{triple}"
+    )
+    .unwrap();
+
+    let env = env.chain([
         // Tell cargo what target to build for.
-        ("CARGO_BUILD_TARGET".to_owned(), format!("{triple}")),
-        // Use all LLVM components, including the linker, standard C++ library
-        // and runtime libraries. Without being explicit about that, clang
-        // might still try to use the GNU equivalents.
-        ("CXXFLAGS".to_owned(), format!("{} --stdlib=libc++", env::var("CXXFLAGS").unwrap_or_default())),
-        ("LDFLAGS".to_owned(), format!("{} -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind", env::var("LDFLAGS").unwrap_or_default())),
+        ("CARGO_BUILD_TARGET", OsString::from(format!("{triple}")).into()),
+        ("CXXFLAGS", cxxflags.into()),
+        ("LDFLAGS", ldflags.into()),
         // Include the directories of the LLVM and Rust toolchains in `PATH`.
-        ("PATH".to_owned(), format!("/root/.cargo/bin:/usr/lib/llvm/{LLVM_VERSION}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")),
+        ("PATH", OsString::from(format!("/root/.cargo/bin:/usr/lib/llvm/{LLVM_VERSION}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")).into()),
         // Point `pkg-config` to the cross sysroot.
-        ("PKG_CONFIG_SYSROOT_DIR".to_owned(), format!("/usr/{triple}")),
+        ("PKG_CONFIG_SYSROOT_DIR", OsString::from(format!("/usr/{triple}")).into()),
         // Point to the directory with Rust toolchains.
-        ("RUSTUP_HOME".to_owned(), "/root/.rustup".to_owned()),
+        ("RUSTUP_HOME", OsStr::new("/root/.rustup").into()),
         // Tell Rust to use the cross sysroot and to use a clang wrapper as its
         // linker.
-        ("RUSTFLAGS".to_owned(), format!("{} -C linker={triple}-clang -C link-arg=--sysroot=/usr/{triple}",
-            env::var("RUSTFLAGS").unwrap_or_default()
-        )),
-    ]);
-    if override_cc_with_cross {
-        env.extend_from_slice(&[
-            ("CC".to_owned(), format!("{triple}-clang")),
-            ("CXX".to_owned(), format!("{triple}-clang++")),
-        ]);
-    }
+        ("RUSTFLAGS", rustflags.into()),
+    ].into_iter().map(|(key, value)| {
+        (OsStr::new(key).into(), value)
+    }));
+    let env = if override_cc_with_cross {
+        either::Left(
+            env.chain(
+                [
+                    ("CC", format!("{triple}-clang")),
+                    ("CXX", format!("{triple}-clang++")),
+                ]
+                .map(|(key, value)| (OsStr::new(key).into(), OsString::from(value).into())),
+            ),
+        )
+    } else {
+        either::Right(env)
+    };
     let Triple { architecture, .. } = triple;
-    if architecture != &target_lexicon::HOST.architecture {
-        let triple = triple.to_string().to_uppercase().replace('-', "_");
-        env.push((
-            format!("CARGO_TARGET_{triple}_RUNNER"),
-            format!("qemu-{architecture}"),
-        ));
+    if architecture == &target_lexicon::HOST.architecture {
+        either::Left(env)
+    } else {
+        let mut cargo_target_triple_runner = format!("CARGO_TARGET_{triple}_RUNNER");
+        cargo_target_triple_runner.make_ascii_uppercase();
+        // SAFETY: we promise not to put invalid UTF-8 in the string.
+        for c in unsafe { cargo_target_triple_runner.as_bytes_mut() } {
+            if *c == b'-' {
+                *c = b'_';
+            }
+        }
+        either::Right(env.chain(std::iter::once((
+            OsString::from(cargo_target_triple_runner).into(),
+            OsString::from(format!("qemu-{architecture}")).into(),
+        ))))
     }
-    env
 }
 
 async fn download_layer(
