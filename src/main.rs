@@ -440,7 +440,7 @@ fn build_container_image(args: BuildContainerImageArgs) -> anyhow::Result<()> {
     if push {
         for tag in &tags {
             if let Err(e) = push_image(&container_engine, tag)
-                .with_context(|| format!("failed to push the tag {tag:?}"))
+                .with_context(|| format!("failed to push the tag {}", tag.display()))
             {
                 errors.push(e);
             }
