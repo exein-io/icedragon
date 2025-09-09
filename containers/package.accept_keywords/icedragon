@@ -33,9 +33,32 @@
 # More details:
 # https://wiki.gentoo.org/wiki/Knowledge_Base:Accepting_a_keyword_for_a_single_package
 
+# Unmask the latest, not yet stable LLVM 21 ebuilds, which contain the
+# following fixes for crossdev on musl-llvm profile:
+# * https://github.com/gentoo/gentoo/pull/39280
+# * https://github.com/gentoo/gentoo/pull/42663
+=llvm-core/clang-21.1.0
+=llvm-core/clang-common-21.1.0
+=llvm-core/clang-linker-config-21
+=llvm-core/clang-toolchain-symlinks-21
+=llvm-core/lld-21.1.0
+=llvm-core/lld-toolchain-symlinks-21
+=llvm-core/llvm-21.1.0
+=llvm-core/llvm-common-21.1.0
+=llvm-core/llvm-toolchain-symlinks-21
+=llvm-runtimes/clang-rtlib-config-21
+=llvm-runtimes/clang-runtime-21.1.0-r1
+=llvm-runtimes/clang-stdlib-config-21
+=llvm-runtimes/clang-unwindlib-config-21
+=llvm-runtimes/compiler-rt-21.1.0-r1
+=llvm-runtimes/compiler-rt-sanitizers-21.1.0-r1
+=llvm-runtimes/libcxx-21.1.0-r1
+=llvm-runtimes/libcxxabi-21.1.0-r1
+=llvm-runtimes/libunwind-21.1.0-r1
+=llvm-runtimes/offload-21.1.0
+=llvm-runtimes/openmp-21.1.0
+
 # llvm-runtimes/libgcc is undergoing testing for amd64 and provides no keywords
 # for the rest of architectures. Unmask it with `**`. Our CI proves that it works
 # with arm64.
-=llvm-runtimes/libgcc-19.1.7 **
-# libgcc requires a testing version (19.1.7) of libunwind.
-=llvm-runtimes/libunwind-19.1.7
+=llvm-runtimes/libgcc-21.1.0 **
