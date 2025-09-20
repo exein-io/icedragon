@@ -28,12 +28,18 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 futures = { version = "0.3", default-features = false }
 indicatif = { version = "0.17", default-features = false }
 ipc-channel = { version = "0.19", default-features = false }
+liblzma = { version = "0.3", default-features = false }
 log = { version = "0.4", default-features = false }
 nix = { version = "0.29.0", default-features = false, features = ["event", "fs", "mount", "sched", "user"] }
 oci-client = { version = "0.14", default-features = false, features = ["rustls-tls"] }
+oci-spec = { version = "0.6.2", default-features = false, features = ["image"] }
+oci-tar-builder = { version = "0.4", default-features = false }
 rand = { version = "0.9", default-features = false, features = ["os_rng", "std_rng"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", default-features = false }
 serde-error = { version = "0.1", default-features = false }
+serde_json = { version = "1.0", default-features = false }
+sha256 = { version = "1.6", default-features = false }
 target-lexicon = { version = "0.12", default-features = false }
 tar = { version = "0.4", default-features = false }
 thiserror = { version = "1.0.64", default-features = false }
@@ -44,8 +50,6 @@ which = { version = "6.0", default-features = false }
 
 [dev-dependencies]
 goblin = { version = "0.9", default-features = false, features = ["elf32", "elf64", "endian_fd", "std"] }
-liblzma = { version = "0.3", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 tar = { version = "0.4", default-features = false }
 tempfile = { version = "3.16", default-features = false }
 test-case = { version = "3.3", default-features = false }

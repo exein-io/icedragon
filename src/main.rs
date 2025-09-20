@@ -1,11 +1,11 @@
 use std::{
     borrow::Cow,
-    collections::{vec_deque::Iter, VecDeque},
+    collections::{vec_deque::Iter, HashMap, VecDeque},
     env,
     ffi::{OsStr, OsString},
-    fmt::Write as _,
+    fmt::{Debug, Write as _},
     fs,
-    io::{BufRead as _, BufReader, Write as _},
+    io::{self, BufRead, BufReader, Read, Write as _},
     iter,
     os::unix::{ffi::OsStrExt as _, fs as unix_fs, process::ExitStatusExt as _},
     path::{Component, Path, PathBuf},
@@ -17,8 +17,10 @@ use std::{
 
 use anyhow::{anyhow, Context as _};
 use clap::{Parser, Subcommand, ValueEnum};
+use flate2::bufread::GzDecoder;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use ipc_channel::ipc;
+use liblzma::bufread::XzDecoder;
 use log::{debug, error, info};
 use nix::{
     mount::{mount, MsFlags},
@@ -189,7 +191,7 @@ struct BuildContainerImageArgs {
         name = "tag",
         default_value = "ghcr.io/exein-io/icedragon:latest"
     )]
-    tags: Vec<OsString>,
+    tags: Vec<String>,
 }
 
 /// Parse a single key-value pair CLI argument, using `:` as a delimiter.
@@ -293,6 +295,92 @@ fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result
     Ok(())
 }
 
+fn parse_stage3_info(content: &str) -> anyhow::Result<(&str, u64)> {
+    for line in content.lines() {
+        if line.starts_with("stage3") {
+            let parts: Vec<_> = line.split_whitespace().take(2).collect();
+            return match parts.as_slice() {
+                [filename, size] => {
+                    let size = size.parse::<u64>().with_context(|| {
+                        format!("could not parse the stage3 file size from `{size}`")
+                    })?;
+                    Ok((filename, size))
+                }
+                _ => Err(anyhow!("could not parse the line `{line}`")),
+            };
+        }
+    }
+
+    Err(anyhow!(
+        "could not find the stage3 tarball filename in: {content}"
+    ))
+}
+
+async fn maybe_download_stage3(stage3_dir: &Path) -> anyhow::Result<PathBuf> {
+    const BASE_URL: &str =
+        "https://gentoo.osuosl.org/releases/amd64/autobuilds/current-stage3-amd64-llvm-openrc";
+    const LATEST_FILE: &str = "latest-stage3-amd64-llvm-openrc.txt";
+
+    let client = reqwest::Client::new();
+
+    let latest_url = format!("{}/{}", BASE_URL, LATEST_FILE);
+    let content = client
+        .get(&latest_url)
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch latest version info from {latest_url}"))?
+        .text()
+        .await
+        .with_context(|| format!("failed to read response text from {latest_url}"))?;
+    let (filename, size) = parse_stage3_info(&content).with_context(|| {
+        format!("failed to parse stage3 information downloaded from {latest_url}")
+    })?;
+
+    let stage3_path = stage3_dir.join(filename);
+    if stage3_path.exists() {
+        return Ok(stage3_path);
+    }
+
+    let stage3_url = format!("{}/{}", BASE_URL, filename);
+    let response = client
+        .get(&stage3_url)
+        .send()
+        .await
+        .with_context(|| "failed to send download request to {stage3_url}")?;
+    let size = response.content_length().unwrap_or(size);
+    let mut stream = response.bytes_stream();
+
+    let stage3_file = tokio::fs::File::create(&stage3_path)
+        .await
+        .with_context(|| format!("failed to open stage3 file: {}", stage3_path.display()))?;
+    let mut stage3_file = tokio::io::BufWriter::new(stage3_file);
+
+    let pb = ProgressBar::new(size);
+    let pb_style =
+        ProgressStyle::with_template(PROGRESS_BAR_TEMPLATE)?.progress_chars(PROGRESS_BAR_CHARS);
+    pb.set_style(pb_style);
+    while let Some(res) = stream.next().await {
+        let chunk = res
+            .with_context(|| format!("failed to read the stream of stage3 tarball {stage3_url}"))?;
+        stage3_file.write_all(&chunk).await.with_context(|| {
+            format!(
+                "failed to write the chunk of the stage3 tarball {stage3_url} into {}",
+                stage3_url
+            )
+        })?;
+        let chunk_len = chunk.len();
+        let chunk_len = u64::try_from(chunk_len)
+            .with_context(|| format!("invaid chunk length: {chunk_len}"))?;
+        pb.inc(chunk_len);
+    }
+    stage3_file
+        .flush()
+        .await
+        .with_context(|| format!("failed to flush the stage3 file {}", stage3_path.display()))?;
+
+    Ok(stage3_path)
+}
+
 /// Builds a container image.
 ///
 /// # Errors
@@ -301,103 +389,215 @@ fn push_image(container_engine: &ContainerEngine, tag: &OsStr) -> anyhow::Result
 ///
 /// * The image build was unsuccessful.
 /// * If any of the tags could not be pushed.
-fn build_container_image(args: BuildContainerImageArgs) -> anyhow::Result<()> {
-    /// Content of the dockerfile.
-    const DOCKERFILE: &[u8] = include_bytes!("../containers/Dockerfile");
+fn build_container_image(state_dir: PathBuf, args: BuildContainerImageArgs) -> anyhow::Result<()> {
+    let rootfs_dir: String = StdRng::from_os_rng()
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let rootfs_dir = Path::new("/tmp").join(rootfs_dir);
+    fs::create_dir_all(&rootfs_dir)
+        .with_context(|| format!("failed to create build directory {}", rootfs_dir.display()))?;
 
-    let BuildContainerImageArgs {
-        container_engine,
-        no_cache,
-        push,
-        tags,
-    } = args;
+    let stage3_dir = state_dir.join("stage3");
+    // if !stage3_dir.exists() {
+    fs::create_dir_all(&stage3_dir)
+        .with_context(|| format!("failed to create stage3 directory {}", stage3_dir.display()))?;
+    // }
 
-    let container_engine = match container_engine {
-        Some(container_engine) => container_engine,
-        None => ContainerEngine::autodetect()?,
-    };
+    let stage3_path = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the tokio runtme for downloading the stage3 tarbal")?
+        .block_on(maybe_download_stage3(&stage3_dir))?;
 
-    let mut cmd = Command::new(&container_engine);
-    cmd.current_dir("containers");
-    cmd.args(["buildx", "build"]);
-    for tag in &tags {
-        cmd.arg("-t").arg(tag);
-    }
-    cmd.args(["-f", "-", "."])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if no_cache {
-        cmd.arg("--no-cache");
-    }
-    info!("Building container image with command: {cmd:?}");
+    info!("📦 Unpacking stage3 tarball");
+    unpack_tarball(stage3_path, ArchiveType::Xz, &rootfs_dir)?;
 
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn command {cmd:?}"))?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .unwrap_or_else(|| panic!("expected piped stdin in command {cmd:?}"));
-        stdin.write_all(DOCKERFILE).with_context(|| {
-            format!("failed to write the dockerfile content to stdin of command {cmd:?}")
-        })?;
-    }
-    let stdout = child
-        .stdout
-        .take()
-        .unwrap_or_else(|| panic!("expected piped stdout in command {cmd:?}"));
-    let stderr = child
-        .stderr
-        .take()
-        .unwrap_or_else(|| panic!("expected piped stderr in command {cmd:?}"));
-    thread::scope(|s| {
-        s.spawn(|| {
-            for line in BufReader::new(stdout).lines() {
-                let line = line.unwrap_or_else(|e| {
-                    panic!("failed to retrieve stdout line from command {cmd:?}: {e:?}")
-                });
-                info!("{line}");
-            }
+    let accept_keywords_dir = rootfs_dir.join("etc/portage/package.accept_keywords");
+    fs::create_dir_all(&accept_keywords_dir).with_context(|| {
+        format!(
+            "failed to create directory {}",
+            accept_keywords_dir.display()
+        )
+    })?;
+    let accept_keywords_path = accept_keywords_dir.join("icedragon");
+    fs::write(
+        &accept_keywords_path,
+        include_bytes!("../containers/package.accept_keywords/icedragon"),
+    )
+    .with_context(|| format!("failed to write to {}", accept_keywords_path.display()))?;
+
+    let mask_dir = rootfs_dir.join("etc/portage/package.mask/icedragon");
+    fs::create_dir_all(&mask_dir)
+        .with_context(|| format!("failed to create directory {}", mask_dir.display()))?;
+    let mask_path = mask_dir.join("icedragon");
+    fs::write(
+        &mask_path,
+        include_bytes!("../containers/package.mask/icedragon"),
+    )
+    .with_context(|| format!("failed to write to {}", mask_path.display()))?;
+
+    let image_dir: String = StdRng::from_os_rng()
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let image_dir = Path::new("/tmp").join(image_dir);
+    fs::create_dir_all(&image_dir)
+        .with_context(|| format!("failed to create image directory {}", image_dir.display()))?;
+
+    run_container(&rootfs_dir, &[], || {
+        chdir("/")?;
+
+        // To be able to re-use these variables multiple times, we must collect
+        // them.
+        let env: Vec<_> = prepare_env(&rootfs_dir)?.collect();
+
+        // let mut bash = Command::new("bash");
+        // env.iter().for_each(|(k, v)| {
+        //     bash.env(k, v);
+        // });
+        // bash.status()?;
+
+        let mut emerge_webrsync = Command::new("emerge-webrsync");
+        emerge_webrsync.env_clear();
+        // We could avoid this dance if `Command::envs` was accepting iterators
+        // yielding references of tuples `&(K, V)`.
+        env.iter().for_each(|(k, v)| {
+            emerge_webrsync.env(k, v);
         });
-        s.spawn(|| {
-            for line in BufReader::new(stderr).lines() {
-                let line = line.unwrap_or_else(|e| {
-                    panic!("failed to retrieve stderr line from command {cmd:?}: {e:?}");
-                });
-                // Use `info!` even for stderr. The most of stderr messages are
-                // progress-related logs from emerge, logging them with `error!`
-                // would be confusing.
-                info!("{line}");
-            }
-        });
-    });
-    let status = child
-        .wait()
-        .with_context(|| format!("failed to wait for command {cmd:?}"))?;
-    if !status.success() {
-        return Err(anyhow!(
-            "failed to build container image with command {cmd:?}: {status}"
-        ));
-    }
+        emerge_webrsync
+            .status()
+            .with_context(|| format!("failed to run command {emerge_webrsync:?}"))?;
 
-    let mut errors = Vec::new();
-    if push {
-        for tag in &tags {
-            if let Err(e) = push_image(&container_engine, tag)
-                .with_context(|| format!("failed to push the tag {tag:?}"))
-            {
-                errors.push(e);
-            }
+        let mut emerge = Command::new("emerge");
+        emerge
+            .args([
+                // QEMU can be used for running foreign binaries and therefore
+                // is useful for running `cargo test` for foreign targets.
+                "app-emulation/qemu",
+                // Tool for managing portage repositories.
+                "app-eselect/eselect-repository",
+                "app-misc/ca-certificates",
+                // Rustup manages rust toolchains. Use the Gentoo package, it
+                // has no downstream patches and saves us from writing more
+                // boilerplate code.
+                "dev-util/rustup",
+                // To allow using git dependencies in crates.
+                "dev-vcs/git",
+                // Crossdev is a manager of sysroots, providing wrapper for:
+                // * clang, which can be used for compiling C/C++ projects
+                //   without doing the whole dance with `--target` and
+                //   `--sysroot` arguments.
+                // * emerge, which lets you install packages in the cross sysroot.
+                // For example, if you create a sysroot for aarch64-unknown-linux-musl,
+                // crossdev creates aarch64-linux-musl-clang{,++} and
+                // aarch64-linux-musl-emerge wrappers.
+                "sys-devel/crossdev",
+            ])
+            .env_clear();
+        env.iter().for_each(|(k, v)| {
+            emerge.env(k, v);
+        });
+        emerge
+            .status()
+            .with_context(|| format!("failed to run command {emerge:?}"))?;
+
+        let mut eselect = Command::new("eselect");
+        eselect
+            .args(["repository", "create", "crossdev"])
+            .env_clear();
+        env.iter().for_each(|(k, v)| {
+            eselect.env(k, v);
+        });
+        eselect
+            .status()
+            .with_context(|| format!("failed to run command {eselect:?}"))?;
+
+        for arch in ["aarch64", "x86_64", "riscv64"] {
+            // Create sysroot with LLVM and musl for the given architecture.
+            let target = format!("{arch}-unknown-linux-musl");
+            let mut crossdev = Command::new("crossdev");
+            crossdev
+                .args(["--llvm", "--target"])
+                .arg(target)
+                .env_clear();
+            env.iter().for_each(|(k, v)| {
+                crossdev.env(k, v);
+            });
+            crossdev
+                .status()
+                .with_context(|| format!("failed to run command {crossdev:?}"))?;
+
+            // Install the following dependencies, that can be considered
+            // "build essentials" for the most of C/C++ software on Linux, as
+            // well as for Rust crates, which don't vendor C dependencies and
+            // expect them to be present in the system.
+            let cross_emerge = format!("{arch}-unknown-linux-musl-emerge");
+            let mut cross_emerge = Command::new(cross_emerge);
+            cross_emerge
+                .args([
+                    "app-arch/brotli",
+                    "app-arch/xz-utils",
+                    "app-arch/zstd",
+                    "app-crypt/gpgme",
+                    "dev-db/sqlite",
+                    "dev-libs/json-c",
+                    "dev-libs/libpcre2",
+                    "dev-libs/openssl",
+                    "dev-libs/rocksdb",
+                    // llvm-libgcc is a drop-in replacement of libgcc_s provided
+                    // by LLVM community. It allows running binaries linked to
+                    // libgcc_s and well as linking your own ones.
+                    "llvm-runtimes/libgcc",
+                    "net-dns/c-ares",
+                    "net-misc/curl",
+                    "sys-apps/util-linux",
+                    // `*-standalone` are musl-compatible ports of GNU libc
+                    // extensions.
+                    "sys-libs/argp-standalone",
+                    "sys-libs/error-standalone",
+                    "sys-libs/fts-standalone",
+                    "sys-libs/zlib",
+                ])
+                .env_clear()
+                // Enable static libraries.
+                .env("USE", "static");
+            env.iter().for_each(|(k, v)| {
+                cross_emerge.env(k, v);
+            });
+            cross_emerge
+                .status()
+                .with_context(|| format!("failed to run command {cross_emerge:?} "))?;
+
+            let mut bash = Command::new("bash");
+            env.iter().for_each(|(k, v)| {
+                bash.env(k, v);
+            });
+            bash.status()?;
         }
-    }
-
-    if errors.is_empty() {
         Ok(())
-    } else {
-        Err(anyhow!("failed to push images: {errors:?}"))
-    }
+    })?;
+
+    let image_path = image_dir.join("image.tar");
+    let image_file = std::fs::File::create(&image_path)
+        .with_context(|| format!("failed to open layer file {}", image_path.display()))?;
+    let image_file = std::io::BufWriter::new(image_file);
+    let mut tb = tar::Builder::new(image_file);
+    tb.follow_symlinks(false);
+    tb.append_dir_all(".", &rootfs_dir).with_context(|| {
+        format!(
+            "failed to archive the rootfs directory {}",
+            rootfs_dir.display()
+        )
+    })?;
+
+    // let BuildContainerImageArgs { tags, .. } = args;
+
+    info!("Image file build successfully: {}", image_path.display());
+
+    Ok(())
 }
 
 /// Parses a configuration file containing environment variables.
@@ -706,37 +906,41 @@ fn create_rootfs(rootfs_dir: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("failed to create rootfs directory {}", rootfs_dir.display()))
 }
 
+enum ArchiveType {
+    Gz,
+    Xz,
+}
+
+enum Decoder<R> {
+    Gz(GzDecoder<R>),
+    Xz(XzDecoder<R>),
+}
+
+impl<R> Read for Decoder<R>
+where
+    R: BufRead,
+{
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Decoder::Gz(gz) => gz.read(into),
+            Decoder::Xz(xz) => xz.read(into),
+        }
+    }
+}
+
 /// Unpacks `tarball` in `.tar.gz` format into `dest`.
-fn unpack_tarball<T, D>(tarball_path: T, dest_path: D) -> anyhow::Result<()>
+fn unpack_tarball<T, D>(
+    tarball_path: T,
+    archive_type: ArchiveType,
+    dest_path: D,
+) -> anyhow::Result<()>
 where
     T: AsRef<Path>,
     D: AsRef<Path>,
 {
-    let tarball_path = tarball_path.as_ref();
-    let dest_path = dest_path.as_ref();
-    let tarball = std::fs::File::open(tarball_path)
-        .with_context(|| format!("failed to open the tarball {}", tarball_path.display()))?;
-    let reader = std::io::BufReader::new(&tarball);
-    let stream = flate2::bufread::GzDecoder::new(reader);
-    let mut archive = tar::Archive::new(stream);
-    archive.unpack(dest_path).with_context(|| {
-        format!(
-            "failed to unpack tarball {} into {}",
-            tarball_path.display(),
-            dest_path.display()
-        )
-    })
-}
-
-fn unpack_image(
-    rootfs_dir: &Path,
-    download_dir: &PathBuf,
-    layer_files: impl IntoIterator<Item = PathBuf>,
-) -> anyhow::Result<()> {
-    info!("📦 Unpacking image");
-    // NOTE(vadorovsky): You might be wondering why downloading is done in async
-    // Rust and unpacking is not. The reason is - there are multiple
-    // `tokio-tar` crates... and none of them is working properly:
+    // NOTE(vadorovsky): You might be wondering why downloading tarballs is
+    // done in async Rust and unpacking is not. The reason is - there are
+    // multiple `tokio-tar` crates... and none of them is working properly:
     //
     // * `tokio-tar` and `krata-tokio-tar` are not able to unpack Python
     //   artifacts, failing with errors like `failed to unpack [..]/__pycache__/t`.
@@ -758,12 +962,38 @@ fn unpack_image(
     // possible.
     //
     // [0] https://github.com/alexcrichton/tar-rs/issues/379
+
+    let tarball_path = tarball_path.as_ref();
+    let dest_path = dest_path.as_ref();
+    let tarball = std::fs::File::open(tarball_path)
+        .with_context(|| format!("failed to open the tarball {}", tarball_path.display()))?;
+    let reader = std::io::BufReader::new(&tarball);
+    let stream = match archive_type {
+        ArchiveType::Gz => Decoder::Gz(GzDecoder::new(reader)),
+        ArchiveType::Xz => Decoder::Xz(XzDecoder::new(reader)),
+    };
+    let mut archive = tar::Archive::new(stream);
+    archive.unpack(dest_path).with_context(|| {
+        format!(
+            "failed to unpack tarball {} into {}",
+            tarball_path.display(),
+            dest_path.display()
+        )
+    })
+}
+
+fn unpack_image(
+    rootfs_dir: &Path,
+    download_dir: &PathBuf,
+    layer_files: impl IntoIterator<Item = PathBuf>,
+) -> anyhow::Result<()> {
+    info!("📦 Unpacking image");
     let (tx, rx) = mpsc::channel();
     thread::scope(move |s| {
         for layer_file in layer_files {
             let tx = tx.clone();
             s.spawn(move || {
-                let res = unpack_tarball(&layer_file, rootfs_dir);
+                let res = unpack_tarball(&layer_file, ArchiveType::Gz, rootfs_dir);
                 tx.send(res).unwrap_or_else(|e| {
                     panic!("failed to send the result of the unpacking thread: {e:?}")
                 });
@@ -1431,7 +1661,7 @@ fn main() -> anyhow::Result<ExitCode> {
 
     match command {
         Commands::BuildContainerImage(args) => {
-            build_container_image(args)?;
+            build_container_image(state_dir, args)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Cargo(args) => {
