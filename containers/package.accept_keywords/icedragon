@@ -37,3 +37,8 @@
 # for the rest of architectures. Unmask it with `**`. Our CI proves that it works
 # with other architectures as well.
 =llvm-runtimes/libgcc-20.1.8 **
+
+# Testing release of crossdev that supports full bootstrap of musl-llvm
+# sysroots without any additional hacks:
+# https://github.com/gentoo/crossdev/pull/24
+=sys-devel/crossdev-20251008
