@@ -31,6 +31,7 @@ use oci_client::{
     Client as OciClient, Reference,
 };
 use rand::{distr::Alphanumeric, rngs::StdRng, Rng as _, SeedableRng as _};
+use serde::{Deserialize, Serialize};
 use target_lexicon::{Architecture, Environment, OperatingSystem, Triple};
 use tokio::io::AsyncWriteExt as _;
 use tokio_stream::StreamExt as _;
@@ -235,62 +236,6 @@ struct RunArgs {
     /// The command to run inside the container.
     #[arg(trailing_var_arg = true)]
     pub cmd: Vec<OsString>,
-}
-
-/// Parameters used to launch a container.
-struct ContainerContext {
-    /// Indicates whether stdin should be piped to the container.
-    interactive: bool,
-    /// Path to the main directory with icedragon's state.
-    state_dir: PathBuf,
-    /// Path to the container root filesystem.
-    rootfs_dir: PathBuf,
-    /// Target triple.
-    triple: Triple,
-    /// Indicates whether `CC` and `CXX` variables should be set.
-    ///
-    /// Such override is convenient for the most of Rust projects, where
-    /// `build.rs` calls the C/C++ compiler either through the [`cc`] or
-    /// directly.
-    ///
-    /// However, build systems like `CMake` or Meson often use the C/C++
-    /// compiler for building native binaries, which are needed for performing
-    /// the rest of the build, even during cross builds. In that case, setting
-    /// these variables would break the native build. Furthermore, these build
-    /// system are smart enough to pick the cross compiler for building cross
-    /// artifacts.
-    override_cc_with_cross: bool,
-    /// List of user-provided volumes to bind mount to the container.
-    volumes: Vec<(PathBuf, PathBuf)>,
-    /// List of command line arguments to launch inside the container.
-    cmd: OsVecDeque,
-}
-
-impl ContainerContext {
-    /// Creates a new [`Self`] based on provided `state_dir`, target `triple`,
-    /// a list of user-provided `volumes` and `cmd` with list of command line
-    /// arguments to launch inside the container.
-    ///
-    /// `interactive` indicates whether stdin should be piped to the container.
-    fn new(
-        interactive: bool,
-        state_dir: PathBuf,
-        triple: Triple,
-        override_cc_with_cross: bool,
-        volumes: Vec<(PathBuf, PathBuf)>,
-        cmd: OsVecDeque,
-    ) -> Self {
-        let rootfs_dir = state_dir.join("rootfs");
-        Self {
-            interactive,
-            state_dir,
-            rootfs_dir,
-            triple,
-            override_cc_with_cross,
-            volumes,
-            cmd,
-        }
-    }
 }
 
 /// Pushes an image with the given `tag` to the registry.
@@ -706,7 +651,7 @@ where
 }
 
 fn unpack_image(
-    ctx: &ContainerContext,
+    rootfs_dir: &Path,
     download_dir: &PathBuf,
     layer_files: impl IntoIterator<Item = PathBuf>,
 ) -> anyhow::Result<()> {
@@ -740,7 +685,7 @@ fn unpack_image(
         for layer_file in layer_files {
             let tx = tx.clone();
             s.spawn(move || {
-                let res = unpack_tarball(&layer_file, &ctx.rootfs_dir);
+                let res = unpack_tarball(&layer_file, rootfs_dir);
                 tx.send(res).unwrap_or_else(|e| {
                     panic!("failed to send the result of the unpacking thread: {e:?}")
                 });
@@ -765,7 +710,11 @@ fn unpack_image(
 /// downloaded image. The image pull is skipped if the digest stored there is
 /// already up-to-date. Otherwise, it's updated after the successfull image
 /// pull.
-fn prepare_container(ctx: &ContainerContext, container_image: &str) -> anyhow::Result<()> {
+fn prepare_container(
+    state_dir: &Path,
+    rootfs_dir: &Path,
+    container_image: &str,
+) -> anyhow::Result<()> {
     let rng = StdRng::from_os_rng();
     let download_dir: String = rng
         .sample_iter(&Alphanumeric)
@@ -780,7 +729,7 @@ fn prepare_container(ctx: &ContainerContext, container_image: &str) -> anyhow::R
         )
     })?;
 
-    let digest_file = ctx.state_dir.join("digest");
+    let digest_file = state_dir.join("digest");
 
     if let Some((digest, layer_files)) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -788,8 +737,8 @@ fn prepare_container(ctx: &ContainerContext, container_image: &str) -> anyhow::R
         .context("failed to build the tokio runtime for pulling the container image")?
         .block_on(pull_image(&download_dir, &digest_file, container_image))?
     {
-        create_rootfs(&ctx.rootfs_dir)?;
-        unpack_image(ctx, &download_dir, layer_files)?;
+        create_rootfs(rootfs_dir)?;
+        unpack_image(rootfs_dir, &download_dir, layer_files)?;
         fs::write(&digest_file, &digest).with_context(|| {
             format!(
                 "failed to write to the local digest file {}",
@@ -977,85 +926,44 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 /// * `/etc/resolv.conf`, which makes sure that resolving domains works insice
 ///   container.
 /// * User-provided bind volumes.
-fn mount_volumes(ctx: &ContainerContext) -> anyhow::Result<()> {
-    proc_mount(&ctx.rootfs_dir)?;
-    dev_mount(&ctx.rootfs_dir)?;
-    bind_mount(&ctx.rootfs_dir, env::current_dir()?, "/src")
+fn mount_volumes(rootfs_dir: &Path, volumes: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+    let rootfs_dir = rootfs_dir.as_ref();
+    proc_mount(rootfs_dir)?;
+    dev_mount(rootfs_dir)?;
+    bind_mount(rootfs_dir, env::current_dir()?, "/src")
         .context("failed to mount the current directory")?;
-    bind_mount(&ctx.rootfs_dir, "/etc/resolv.conf", "/etc/resolv.conf")?;
+    bind_mount(rootfs_dir, "/etc/resolv.conf", "/etc/resolv.conf")?;
     // Mount the directory with SSH keys (`$HOME/.ssh`) to be able to access
     // private repositories.
     let home_dir = home_dir()?;
     let ssh_keys_dir = Path::new(&home_dir).join(".ssh");
     if ssh_keys_dir.exists() {
-        bind_mount(&ctx.rootfs_dir, ssh_keys_dir, "/root/.ssh")?;
+        bind_mount(rootfs_dir, ssh_keys_dir, "/root/.ssh")?;
     }
     if let Some(ssh_auth_sock) = env::var_os("SSH_AUTH_SOCK") {
-        bind_mount(&ctx.rootfs_dir, &ssh_auth_sock, &ssh_auth_sock)?;
+        bind_mount(rootfs_dir, &ssh_auth_sock, &ssh_auth_sock)?;
     }
     // Mount all the user-provided volumes.
-    for (src, dst) in &ctx.volumes {
-        bind_mount(&ctx.rootfs_dir, src, dst)
-            .context("failed to mount an user-provided directory")?;
+    for (src, dst) in volumes.into_iter() {
+        bind_mount(rootfs_dir, src, dst).context("failed to mount an user-provided directory")?;
     }
     Ok(())
 }
 
-fn container_child(ctx: &ContainerContext) -> anyhow::Result<u8> {
-    mount_volumes(ctx)?;
-    chroot(&ctx.rootfs_dir).context("`chroot` syscall failed")?;
-    chdir("/src").context("failed to change directory to `/src`")?;
-
-    let envs = prepare_env(&ctx.triple, ctx.override_cc_with_cross);
-
-    let mut cmd = ctx.cmd.command()?;
-    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    if ctx.interactive {
-        cmd.stdin(Stdio::inherit());
-    }
-    let status = cmd
-        .env_clear()
-        .envs(envs)
-        .spawn()
-        .with_context(|| format!("failed to run command {cmd:?}"))?
-        .wait()
-        .with_context(|| format!("failed to wait for command {cmd:?}"))?;
-    let status = status.code().ok_or_else(|| {
-        // In case child's exit code could not be retrieved, try to figure out
-        // the reason and return an error.
-        if let Some(signal) = status.signal() {
-            anyhow!("command {cmd:?} was terminated by signal {signal}")
-        } else if let Some(signal) = status.stopped_signal() {
-            anyhow!("command {cmd:?} was stopped by signal {signal}")
-        } else if status.continued() {
-            anyhow!("failed to retrieve the status of continued command {cmd:?}")
-        } else {
-            anyhow!("failed to retrieve the status of command {cmd:?}")
-        }
-    })?;
-    // We want to return the child's exit code in our main parent process. The
-    // cleanest way to return an exit code in Rust is to return any type
-    // implemementing `Termination` trait in the `main` function. The simpliest
-    // type implementing it is `ExitCode`.
-    // `ExitCode` implements only `From<u8>`. Correct exit codes in Unix-like
-    // systems should fit into `u8`.
-    // There is an unstable Windows API implementing `From<u32>`, but for now
-    // we don't care about it.
-    // We return `u8` instead of `ExitCode`, because it's easier to send it
-    // through the IPC channel, We convert it later on the parent side.
-    let status = u8::try_from(status).with_context(|| format!("invalid status code {status}"))?;
-
-    Ok(status)
-}
-
 /// Runs a container, based on provided `cmd` and `rootfs_dir`.
-fn run_container(ctx: ContainerContext) -> anyhow::Result<ExitCode> {
+fn run_container<T: for<'a> Deserialize<'a> + Serialize>(
+    rootfs_dir: &Path,
+    volumes: &[(PathBuf, PathBuf)],
+    mut cb: impl FnMut() -> Result<T, anyhow::Error>,
+) -> anyhow::Result<T> {
     // Channel for notifying the readiness of the child process, ensuring that
     // UID/GID mapping is not written too early.
     let (child_tx, child_rx) = ipc::channel()?;
     // Channel for notifying about the readiness of UID/GID mapping, ensuring
     // that `chroot` and the command are not called before it's done.
     let (id_map_tx, id_map_rx) = ipc::channel()?;
+    // Channel for handling a serializable result of the `cb` closure, that can
+    // be handled in the main process.
     let (res_tx, res_rx) = ipc::channel()?;
 
     // Spawn a separate process with new namespaces and in our sysroot.
@@ -1065,12 +973,19 @@ fn run_container(ctx: ContainerContext) -> anyhow::Result<ExitCode> {
     // zeroed buffer.
     let pid = unsafe {
         clone(
-            Box::new(move || {
+            Box::new(|| {
                 child_tx
                     .send(())
                     .expect("failed to notify the parent process about readiness");
                 id_map_rx.recv().expect("failed to retrieve the message about readiness of UID/GID mappings from the parent process");
-                let res = container_child(&ctx).map_err(|e| serde_error::Error::new(&*e));
+
+                let res = || -> Result<T, anyhow::Error> {
+                    mount_volumes(rootfs_dir, volumes)?;
+                    chroot(rootfs_dir).context("`chroot` syscall failed")?;
+
+                    cb()
+                }()
+                .map_err(|e| serde_error::Error::new(&*e));
                 res_tx
                     .send(res)
                     .expect("failed to send child result to the channel");
@@ -1094,12 +1009,10 @@ fn run_container(ctx: ContainerContext) -> anyhow::Result<ExitCode> {
     write_mappings(pid)?;
     id_map_tx.send(())?;
 
-    let exit_code = res_rx
-        .recv()?
-        .context("containerized process failed with an error")?
-        .into();
-
-    Ok(exit_code)
+    let res = res_rx
+        .recv()
+        .context("failed to receive the result of the child process from the channel")?;
+    res.map_err(anyhow::Error::from)
 }
 
 /// Runs cargo inside a container.
@@ -1247,16 +1160,50 @@ fn run(
     volumes: Vec<(PathBuf, PathBuf)>,
     cmd: OsVecDeque,
 ) -> anyhow::Result<ExitCode> {
-    let ctx = ContainerContext::new(
-        interactive,
-        state_dir,
-        triple,
-        override_cc_with_cross,
-        volumes,
-        cmd,
-    );
-    prepare_container(&ctx, container_image)?;
-    run_container(ctx)
+    let rootfs_dir = state_dir.join("rootfs");
+    prepare_container(&state_dir, &rootfs_dir, container_image)?;
+    let status = run_container(&rootfs_dir, &volumes, || {
+        chdir("/src").context("failed to change directory to `/src`")?;
+        let envs = prepare_env(&triple, override_cc_with_cross);
+
+        let mut cmd = cmd.command()?;
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        if interactive {
+            cmd.stdin(Stdio::inherit());
+        }
+        let status = cmd
+            .env_clear()
+            .envs(envs)
+            .spawn()
+            .with_context(|| format!("failed to run command {cmd:?}"))?
+            .wait()
+            .with_context(|| format!("failed to wait for command {cmd:?}"))?;
+        let status = status.code().ok_or_else(|| {
+            // In case child's exit code could not be retrieved, try to figure out
+            // the reason and return an error.
+            if let Some(signal) = status.signal() {
+                anyhow!("command {cmd:?} was terminated by signal {signal}")
+            } else if let Some(signal) = status.stopped_signal() {
+                anyhow!("command {cmd:?} was stopped by signal {signal}")
+            } else if status.continued() {
+                anyhow!("failed to retrieve the status of continued command {cmd:?}")
+            } else {
+                anyhow!("failed to retrieve the status of command {cmd:?}")
+            }
+        })?;
+        // We want to return the child's exit code in our main parent process. The
+        // cleanest way to return an exit code in Rust is to return any type
+        // implemementing `Termination` trait in the `main` function. The simpliest
+        // type implementing it is `ExitCode`.
+        // `ExitCode` implements only `From<u8>`. Correct exit codes in Unix-like
+        // systems should fit into `u8`.
+        // There is an unstable Windows API implementing `From<u32>`, but for now
+        // we don't care about it.
+        // We return `u8` instead of `ExitCode`, because it's easier to send it
+        // through the IPC channel, We convert it later on the parent side.
+        u8::try_from(status).with_context(|| format!("invalid status code {status}"))
+    })?;
+    Ok(status.into())
 }
 
 /// Parses and validates the given `target` triple.
