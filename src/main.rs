@@ -6,7 +6,7 @@ use std::{
     fmt::Write as _,
     fs,
     io::{BufRead as _, BufReader, Write as _},
-    os::unix::{ffi::OsStrExt as _, process::ExitStatusExt as _},
+    os::unix::{ffi::OsStrExt as _, fs as unix_fs, process::ExitStatusExt as _},
     path::{Component, Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     str::FromStr,
@@ -809,6 +809,10 @@ fn dev_mount(rootfs_dir: &Path) -> anyhow::Result<()> {
         Some("mode=755,size=65536k"),
     )
     .with_context(|| format!("failed to mount tmpfs into {}", dev_path.display()))?;
+    debug!("Creating /dev/fd symlink");
+    let dev_fd = rootfs_dir.join("dev/fd");
+    unix_fs::symlink("/proc/self/fd", &dev_fd)
+        .with_context(|| format!("failed to create symlink {}", dev_fd.display()))?;
     debug!("Mounting /dev/mqueue");
     let mqueue_path = rootfs_dir.join("dev/mqueue");
     fs::create_dir_all(&mqueue_path)?;
