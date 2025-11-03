@@ -894,10 +894,21 @@ fn dev_mount(rootfs_dir: &Path) -> anyhow::Result<()> {
         &pts_path,
         Some("devpts"),
         MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
-        // Some("newinstance,ptmxmode=0666,mode=0620,gid=5"),
-        None::<&str>,
+        Some("newinstance,ptmxmode=0666,mode=0620,gid=5"),
     )
     .with_context(|| format!("failed to mount devpts into {}", pts_path.display()))?;
+    debug!("Creating /dev/ptmx symlink");
+    let ptmx_path = rootfs_dir.join("dev/ptmx");
+    if ptmx_path.exists() {
+        fs::remove_file(&ptmx_path).with_context(|| {
+            format!(
+                "failed to remove existing /dev/ptmx entry {}",
+                ptmx_path.display()
+            )
+        })?;
+    }
+    unix_fs::symlink("pts/ptmx", &ptmx_path)
+        .with_context(|| format!("failed to create symlink {}", ptmx_path.display()))?;
     debug!("Mounting /dev/null");
     bind_mount(rootfs_dir, "/dev/null", "/dev/null")?;
     debug!("Mounting /dev/zero");
