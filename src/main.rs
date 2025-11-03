@@ -749,21 +749,75 @@ fn prepare_container(
     Ok(())
 }
 
-/// Writes an ID mapping from the given `host_id` (representing a host user) to
-/// `0` (representing `root` inside container) to the given `map_file`.
-fn write_mapping(map_file: &Path, host_id: u32) -> anyhow::Result<()> {
-    debug!("Writing mapping to {}", map_file.display());
-    let mapping = format!("0 {host_id} 1");
-    std::fs::write(map_file, mapping).with_context(|| {
+/// Writes ID mappings defined by `ranges` into `map_file` using the provided
+/// setuid helper (`newuidmap` or `newgidmap`). Each range maps
+/// `container_start..container_start+length` to the corresponding host range.
+fn write_mappings_with_helper(
+    helper: &str,
+    pid: Pid,
+    map_file: &Path,
+    ranges: &[(u32, u32, u32)],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !ranges.is_empty(),
+        "at least one ID mapping entry is required for {}",
+        map_file.display()
+    );
+
+    let mut cmd = Command::new(helper);
+    cmd.arg(pid.as_raw().to_string());
+    for (container_start, host_start, length) in ranges {
+        let mapping = format!("{container_start} {host_start} {length}");
+        debug!(
+            "Appending mapping `{mapping}` to {} via {}",
+            map_file.display(),
+            helper
+        );
+        cmd.arg(container_start.to_string())
+            .arg(host_start.to_string())
+            .arg(length.to_string());
+    }
+
+    let status = cmd.status().with_context(|| {
         format!(
-            "failed to write the ID mapping to file {}",
-            map_file.display()
+            "failed to run {helper} while configuring ID mappings for pid {}",
+            pid.as_raw()
         )
-    })
+    })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("{helper} exited unsuccessfully ({status:?})"))
+    }
 }
 
-/// Writes UID and UID mappings from the host user to `0` (representing `root`
-/// inside container) for the given `pid`.
+/// Retrieves the first subuid/subgid range for the current user from the given file.
+fn get_subid_range(file: &Path) -> anyhow::Result<(u32, u32)> {
+    let user = env::var("USER").context("`USER` environment variable not set")?;
+    let content = std::fs::read_to_string(file)
+        .with_context(|| format!("failed to read {}", file.display()))?;
+    for line in content.lines() {
+        let mut parts = line.split(':');
+        if let (Some(entry_user), Some(start_str), Some(count_str)) =
+            (parts.next(), parts.next(), parts.next())
+        {
+            if entry_user == user {
+                let start: u32 = start_str
+                    .parse()
+                    .with_context(|| format!("invalid start id in {}", file.display()))?;
+                let count: u32 = count_str
+                    .parse()
+                    .with_context(|| format!("invalid count in {}", file.display()))?;
+                return Ok((start, count));
+            }
+        }
+    }
+    Err(anyhow!("failed to find your user in {}, please configure sub-UIDs and sub-GIDs, e.g. `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {user}`", file.display()))
+}
+
+/// Writes UID and GID mappings defined in `/etc/subuid` and `/etc/subgid` for
+/// the given `pid`.
 fn write_mappings(pid: Pid) -> anyhow::Result<()> {
     let proc_self = Path::new("/proc").join(pid.as_raw().to_string());
     let setgroups_file = proc_self.join("setgroups");
@@ -773,9 +827,17 @@ fn write_mappings(pid: Pid) -> anyhow::Result<()> {
             setgroups_file.display()
         )
     })?;
-    write_mapping(&proc_self.join("uid_map"), Uid::current().as_raw())
+    let (uid_start, uid_count) = get_subid_range(Path::new("/etc/subuid"))?;
+    let (gid_start, gid_count) = get_subid_range(Path::new("/etc/subgid"))?;
+    let current_uid = Uid::current().as_raw();
+    let current_gid = Gid::current().as_raw();
+
+    let uid_ranges = [(0, current_uid, 1), (1, uid_start, uid_count)];
+    let gid_ranges = [(0, current_gid, 1), (1, gid_start, gid_count)];
+
+    write_mappings_with_helper("newuidmap", pid, &proc_self.join("uid_map"), &uid_ranges)
         .context("failed to write UID mapping")?;
-    write_mapping(&proc_self.join("gid_map"), Gid::current().as_raw())
+    write_mappings_with_helper("newgidmap", pid, &proc_self.join("gid_map"), &gid_ranges)
         .context("failed to write GID mapping")?;
     Ok(())
 }
