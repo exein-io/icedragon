@@ -399,23 +399,43 @@ fn build_container_image(args: BuildContainerImageArgs) -> anyhow::Result<()> {
     }
 }
 
-/// Returns environment variables to use in containerized processes, to ensure
-/// successful cross-compilation for the given target `triple`.
-///
-/// The `override_cc_with_cross` parameter indicates whether `CC` and `CXX`
-/// should point to the clang cross wrappers. This override is useful in simple
-/// C/C++ builds where the build system isn't aware of cross-compilation, which
-/// can occur with a straightforward usage of autotools or make. However, for
-/// more complex build systems such as `CMake` or Meson, which differentiate
-/// between native and cross builds, it's better to let them set the compiler
-/// target.
-fn prepare_env(
-    triple: &Triple,
-    override_cc_with_cross: bool,
-) -> impl Iterator<Item = (Cow<'static, OsStr>, Cow<'static, OsStr>)> {
-    /// LLVM version installed in the image.
-    const LLVM_VERSION: u32 = 19;
+/// Parses a configuration file containing environment variables.
+fn parse_env_file(
+    env_path: &Path,
+) -> anyhow::Result<impl Iterator<Item = (Cow<'static, OsStr>, Cow<'static, OsStr>)>> {
+    let env_file = std::fs::File::open(env_path)
+        .with_context(|| format!("failed to open the environment file {}", env_path.display()))?;
+    let reader = std::io::BufReader::new(&env_file);
+    let mut envs = Vec::new();
+    for line in reader.lines() {
+        let line = line.with_context(|| {
+            format!(
+                "failed to read line from the environment file {}",
+                env_path.display()
+            )
+        })?;
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('=');
+        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+            // `key` and `value` are referencing the `line`. We must clone them
+            // to be able to return them.
+            envs.push((OsString::from(key).into(), OsString::from(value).into()));
+        } else {
+            anyhow::bail!(
+                "environment file {} contains invalid key-value mapping: {line}",
+                env_path.display()
+            );
+        }
+    }
+    Ok(envs.into_iter())
+}
 
+/// Returns environment variables to use in containerized processes.
+fn prepare_env(
+    rootfs_dir: &Path,
+) -> anyhow::Result<impl Iterator<Item = (Cow<'static, OsStr>, Cow<'static, OsStr>)>> {
     // Pass the current environment variables, except the ones like `HOME`,
     // `PATH` etc., which would break the containerized environment. We also
     // filter out variables prefixed by `CARGO` and `RUSTUP` to make sure that
@@ -438,6 +458,47 @@ fn prepare_env(
         }
     });
 
+    // Gentoo stores default system-wide environment variables in files inside
+    // /etc/environment.d.
+    let environment_dir = rootfs_dir.join("/etc/environment.d");
+    let entries = std::fs::read_dir(&environment_dir)
+        .with_context(|| format!("failed to read the directory {}", environment_dir.display()))?;
+    // Collect all the conf file iterators into a vector, then flatten them and
+    // chain with the previous iterator `env`.
+    // Collecting is necessary to handle the `Result`. The vector contains just
+    // iterators (pointers with metadata), so no copies of the actual data are
+    // made.
+    let conf_envs = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let env_path = entry.path();
+            if env_path.is_file() && env_path.extension()? == "conf" {
+                Some(parse_env_file(&env_path))
+            } else {
+                None
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten();
+    Ok(env.chain(conf_envs))
+}
+
+/// Returns environment variables to use in containerized processes, to ensure
+/// successful cross-compilation for the given target `triple`.
+///
+/// The `override_cc_with_cross` parameter indicates whether `CC` and `CXX`
+/// should point to the clang cross wrappers. This override is useful in simple
+/// C/C++ builds where the build system isn't aware of cross-compilation, which
+/// can occur with a straightforward usage of autotools or make. However, for
+/// more complex build systems such as `CMake` or Meson, which differentiate
+/// between native and cross builds, it's better to let them set the compiler
+/// target.
+fn prepare_cross_env(
+    rootfs_dir: &Path,
+    triple: &Triple,
+    override_cc_with_cross: bool,
+) -> anyhow::Result<impl Iterator<Item = (Cow<'static, OsStr>, Cow<'static, OsStr>)>> {
     // Use all LLVM components, including the linker, standard C++ library and runtime libraries.
     // Without being explicit about that, clang might still try to use the GNU equivalents.
     let mut cxxflags = env::var_os("CXXFLAGS").unwrap_or_default();
@@ -452,23 +513,30 @@ fn prepare_env(
     )
     .unwrap();
 
-    let env = env.chain([
-        // Tell cargo what target to build for.
-        ("CARGO_BUILD_TARGET", OsString::from(format!("{triple}")).into()),
-        ("CXXFLAGS", cxxflags.into()),
-        ("LDFLAGS", ldflags.into()),
-        // Include the directories of the LLVM and Rust toolchains in `PATH`.
-        ("PATH", OsString::from(format!("/root/.cargo/bin:/usr/lib/llvm/{LLVM_VERSION}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")).into()),
-        // Point `pkg-config` to the cross sysroot.
-        ("PKG_CONFIG_SYSROOT_DIR", OsString::from(format!("/usr/{triple}")).into()),
-        // Point to the directory with Rust toolchains.
-        ("RUSTUP_HOME", OsStr::new("/root/.rustup").into()),
-        // Tell Rust to use the cross sysroot and to use a clang wrapper as its
-        // linker.
-        ("RUSTFLAGS", rustflags.into()),
-    ].into_iter().map(|(key, value)| {
-        (OsStr::new(key).into(), value)
-    }));
+    let env = prepare_env(rootfs_dir)?;
+    let env = env.chain(
+        [
+            // Tell cargo what target to build for.
+            (
+                "CARGO_BUILD_TARGET",
+                OsString::from(format!("{triple}")).into(),
+            ),
+            ("CXXFLAGS", cxxflags.into()),
+            ("LDFLAGS", ldflags.into()),
+            // Point `pkg-config` to the cross sysroot.
+            (
+                "PKG_CONFIG_SYSROOT_DIR",
+                OsString::from(format!("/usr/{triple}")).into(),
+            ),
+            // Point to the directory with Rust toolchains.
+            ("RUSTUP_HOME", OsStr::new("/root/.rustup").into()),
+            // Tell Rust to use the cross sysroot and to use a clang wrapper as its
+            // linker.
+            ("RUSTFLAGS", rustflags.into()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (OsStr::new(key).into(), value)),
+    );
     let env = if override_cc_with_cross {
         either::Left(
             env.chain(
@@ -484,7 +552,7 @@ fn prepare_env(
     };
     let Triple { architecture, .. } = triple;
     if architecture == &target_lexicon::HOST.architecture {
-        either::Left(env)
+        Ok(either::Left(env))
     } else {
         let mut cargo_target_triple_runner = format!("CARGO_TARGET_{triple}_RUNNER");
         cargo_target_triple_runner.make_ascii_uppercase();
@@ -494,10 +562,10 @@ fn prepare_env(
                 *c = b'_';
             }
         }
-        either::Right(env.chain(std::iter::once((
+        Ok(either::Right(env.chain(std::iter::once((
             OsString::from(cargo_target_triple_runner).into(),
             OsString::from(format!("qemu-{architecture}")).into(),
-        ))))
+        )))))
     }
 }
 
@@ -1241,7 +1309,7 @@ fn run(
     prepare_container(&state_dir, &rootfs_dir, container_image)?;
     let status = run_container(&rootfs_dir, &volumes, || {
         chdir("/src").context("failed to change directory to `/src`")?;
-        let envs = prepare_env(&triple, override_cc_with_cross);
+        let envs = prepare_cross_env(&rootfs_dir, &triple, override_cc_with_cross)?;
 
         let mut cmd = cmd.command()?;
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
