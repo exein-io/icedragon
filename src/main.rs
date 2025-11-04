@@ -6,6 +6,7 @@ use std::{
     fmt::Write as _,
     fs,
     io::{BufRead as _, BufReader, Write as _},
+    iter,
     os::unix::{ffi::OsStrExt as _, fs as unix_fs, process::ExitStatusExt as _},
     path::{Component, Path, PathBuf},
     process::{Command, ExitCode, Stdio},
@@ -457,6 +458,15 @@ fn prepare_env(
             Some((key.into(), value.into()))
         }
     });
+
+    // Disable portage's sandboxing features. They tend to throw errors in
+    // in rootless containers, due to attempts to create new namespaces and
+    // calling `setgroups`. They mostly matter for running tests, which we
+    // don't do here.
+    let env = env.chain(iter::once((
+        OsStr::new("FEATURES").into(),
+        OsStr::new("-userpriv -userfetch").into(),
+    )));
 
     // Gentoo stores default system-wide environment variables in files inside
     // /etc/environment.d.
