@@ -1,4 +1,4 @@
-# This file unmasks unstable Gentoo packages.
+# This file accepts unstable packages.
 #
 # Stability of package versions is determined by keywords. Package version is
 # considered stable on the given architecture if it contains a corresponding
