@@ -1,0 +1,9 @@
+# Manage package masks for Gentoo packages. Use this to block installs or to
+# override Gentoo's hard masks when `-` prefixed.
+#
+# Unlike `package.accept_keywords`, this controls general availability of a
+# packages instead of keyword stability.
+
+# llvm-runtimes/libgcc is explicitly masked in Gentoo's default package.mask.
+# Unmask it.
+-llvm-runtimes/libgcc
