@@ -33,6 +33,9 @@
 # More details:
 # https://wiki.gentoo.org/wiki/Knowledge_Base:Accepting_a_keyword_for_a_single_package
 
+# Rustup is considered unstable.
+=dev-util/rustup-1.28.2-r2
+
 # llvm-runtimes/libgcc is undergoing testing for amd64 and provides no keywords
 # for the rest of architectures. Unmask it with `**`. Our CI proves that it works
 # with other architectures as well.
